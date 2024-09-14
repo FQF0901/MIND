@@ -286,24 +286,24 @@ class ScenarioTreeGenerator:
         for idx in range(batch_size):
             orig = data['ORIG'][idx]
             rot = data['ROT'][idx]
-            trajs_ctrs = data['TRAJS'][idx]['TRAJS_CTRS']
-            trajs_vecs = data['TRAJS'][idx]['TRAJS_VECS']
-            trajs_type = data['TRAJS'][idx]["TRAJS_TYPE"]
-            trajs_tid = data['TRAJS'][idx]["TRAJS_TID"]
-            trajs_cat = data['TRAJS'][idx]["TRAJS_CAT"]
+            trajs_ctrs = data['TRAJS'][idx]['TRAJS_CTRS']   # Trajectories Centers
+            trajs_vecs = data['TRAJS'][idx]['TRAJS_VECS']   # Trajectories Vectors
+            trajs_type = data['TRAJS'][idx]["TRAJS_TYPE"]   # Trajectories Types
+            trajs_tid = data['TRAJS'][idx]["TRAJS_TID"] # Trajectories ID
+            trajs_cat = data['TRAJS'][idx]["TRAJS_CAT"] # Trajectories Category
 
             # items in global frame
             theta_global = torch.atan2(rot[1, 0], rot[0, 0])
 
-            trajs_pos_hist = data['TRAJS_POS_HIST'][idx]
-            trajs_ang_hist = data['TRAJS_ANG_HIST'][idx]
-            trajs_vel_hist = data['TRAJS_VEL_HIST'][idx]
-            trajs_cov_hist = data['TRAJS_COV_HIST'][idx]
+            trajs_pos_hist = data['TRAJS_POS_HIST'][idx]    # Trajectories Position History
+            trajs_ang_hist = data['TRAJS_ANG_HIST'][idx]    # Trajectories Angle History
+            trajs_vel_hist = data['TRAJS_VEL_HIST'][idx]    # Trajectories Velocity History
+            trajs_cov_hist = data['TRAJS_COV_HIST'][idx]    # Trajectories Coverage History
 
             parent_id = data['SCEN_ID'][idx]
-            parent_prob = data['SCEN_PROB'][idx]
-            cur_t = data['CUR_T'][idx]
-            end_t = data['END_T'][idx]
+            parent_prob = data['SCEN_PROB'][idx]    # Scenario Probability
+            cur_t = data['CUR_T'][idx]  # Current Time
+            end_t = data['END_T'][idx]  # End Time
 
             res_reg = res_reg_batch[idx].detach()
             res_cls = res_cls_batch[idx].detach()
