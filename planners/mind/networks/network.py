@@ -270,31 +270,50 @@ class RelaFusionNet(nn.Module):
 
 class FusionNet(nn.Module):
     def __init__(self, device, config):
-        super(FusionNet, self).__init__()
-        self.device = device
+        """
+        初始化FusionNet模型类。
 
+        该构造函数初始化了模型所需的设备信息、嵌入维度、相对位置编码维度等配置，
+        并定义了用于对演员（actor）和车道（lane）特征进行投影的线性层，以及场景融合网络。
+
+        参数:
+        - device: 字符串，指示模型在哪个设备（如'cpu'或'cuda'）上运行。
+        - config: 字典，包含模型的各种配置参数，如嵌入维度d_embed，相对位置编码维度d_rpe，
+            dropout率，是否更新边等。
+
+        返回值:
+        无
+        """
+        super(FusionNet, self).__init__()  # 调用父类构造方法
+        self.device = device  # 设置模型运行的设备
+
+        # 从配置字典中提取相关维度和参数
         self.d_embed = config['d_embed']
         self.d_rpe = config['d_rpe']
-        self.d_model = config['d_embed']
-        dropout = config['dropout']
-        update_edge = config['update_edge']
+        self.d_model = config['d_embed']  # 设置模型维度
+        dropout = config['dropout']  # 提取dropout率
+        update_edge = config['update_edge']  # 提取是否更新边的信息
 
+        # 1. 定义用于演员特征投影的线性层和归一化层
         self.proj_actor = nn.Sequential(
             nn.Linear(config['d_actor'], self.d_model),
             nn.LayerNorm(self.d_model),
             nn.ReLU(inplace=True)
         )
+        # 2. 定义用于车道特征投影的线性层和归一化层
         self.proj_lane = nn.Sequential(
             nn.Linear(config['d_lane'], self.d_model),
             nn.LayerNorm(self.d_model),
             nn.ReLU(inplace=True)
         )
+        # 3. 定义用于相对位置编码投影的线性层和归一化层
         self.proj_rpe_scene = nn.Sequential(
             nn.Linear(config['d_rpe_in'], config['d_rpe']),
             nn.LayerNorm(config['d_rpe']),
             nn.ReLU(inplace=True)
         )
 
+        # 4. 初始化场景融合网络
         self.fuse_scene = RelaFusionNet(self.device,
                                         d_model=self.d_model,
                                         d_edge=config['d_rpe'],
@@ -309,34 +328,60 @@ class FusionNet(nn.Module):
                 lanes: Tensor,
                 lane_idcs: List[Tensor],
                 rpe_prep: Dict[str, Tensor]):
-        # projection
+        """
+        前向传播函数，用于处理输入的演员和车道数据，并融合场景信息。
+
+        :param actors: 输入的演员数据张量
+        :param actor_idcs: 演员数据的索引列表
+        :param lanes: 输入的车道数据张量
+        :param lane_idcs: 车道数据的索引列表
+        :param rpe_prep: 相对位置嵌入的预处理数据字典
+        :return: 处理后的演员数据、车道数据和分类信息
+        """
+        # 对演员和车道数据进行投影
         actors = self.proj_actor(actors)
         lanes = self.proj_lane(lanes)
 
+        # 初始化新的数据列表
         actors_new, lanes_new, cls_new = list(), list(), list()
 
+        # 遍历每个样本的演员和车道数据，进行融合处理
         for a_idcs, l_idcs, rpes in zip(actor_idcs, lane_idcs, rpe_prep):
-            # * fusion - scene
+            # 获取当前样本的演员和车道数据
             _actors = actors[a_idcs]
             _lanes = lanes[l_idcs]
+            # 将演员和车道数据合并，完全是SIMPL的架构
             tokens = torch.cat([_actors, _lanes], dim=0)
+
+            # 创建CLS标记(Classification Token)，并将其添加到合并的数据中, 此处借鉴BERT的架构
+            # CLS标记是一个额外的输入标记，用于帮助模型学习整个输入序列的全局特征，通常用于分类任务
             cls_token = torch.zeros((1, self.d_model), device=self.device)
             tokens_with_cls = torch.cat([tokens, cls_token], dim=0)
 
+            # 对相对位置嵌入进行投影，并调整形状
             rpe = self.proj_rpe_scene(rpes['scene'].permute(1, 2, 0))
+            # 创建包含CLS的相对位置嵌入矩阵
+            # 这段代码的主要目的是扩展相对位置编码（Relative Positional Encoding, RPE）以包含CLS标记，因为：
+            # 1. 在序列tokens中加入CLS标记后，整个序列tokens_with_cls的长度变长了。
+            # 2. 相对位置编码也需要相应地扩展，以包含CLS标记的位置信息。
             rpe_with_cls = torch.zeros(
                 (tokens_with_cls.shape[0], tokens_with_cls.shape[0], self.d_rpe),
                 device=self.device)
             rpe_with_cls[:tokens.shape[0], :tokens.shape[0], :] = rpe
 
+            # 使用融合模块处理数据和相对位置嵌入
             out, _ = self.fuse_scene(tokens_with_cls, rpe_with_cls, edge_mask=None)
 
+            # 将处理结果分别添加到对应的列表中
             actors_new.append(out[:len(a_idcs)])
             lanes_new.append(out[len(a_idcs):-1])
             cls_new.append(out[-1].unsqueeze(0))
+
+        # 将所有样本的数据合并
         actors = torch.cat(actors_new, dim=0)
         lanes = torch.cat(lanes_new, dim=0)
         cls = torch.cat(cls_new, dim=0)
+
         return actors, lanes, cls
 
 
@@ -558,20 +603,24 @@ class SceneDecoder(nn.Module):
 class ScenePredNet(nn.Module):
     # Initialization
     def __init__(self, cfg, device):
-        super(ScenePredNet, self).__init__()
+        super(ScenePredNet, self).__init__()    # 调用父类的初始化方法
         self.device = device
 
+        # 初始化演员网络，用于处理演员相关的数据和行为
         self.actor_net = ActorNet(n_in=cfg['in_actor'],
                                   hidden_size=cfg['d_actor'],
                                   n_fpn_scale=cfg['n_fpn_scale'])
 
+        # 初始化车道网络，用于处理车道相关的数据和行为
         self.lane_net = LaneNet(device=self.device,
                                 in_size=cfg['in_lane'],
                                 hidden_size=cfg['d_lane'],
                                 dropout=cfg['dropout'])
 
+        # 初始化融合网络，用于融合演员网络和车道网络的信息
         self.fusion_net = FusionNet(device=self.device, config=cfg)
 
+        # 初始化场景解码器，用于根据融合的信息预测未来的场景
         self.pred_scene = SceneDecoder(device=self.device,
                                        param_out=cfg['param_out'],
                                        hidden_size=cfg['d_embed'],
@@ -579,6 +628,24 @@ class ScenePredNet(nn.Module):
                                        num_modes=cfg['g_num_modes'])
 
     def forward(self, data):
+        """
+        前向传播函数，用于处理输入数据并生成预测结果。
+
+        参数:
+        - data: 包含多个数据部分的元组，具体包括：
+            - actors: 表示演员节点的特征
+            - actor_idcs: 演员节点的索引
+            - lanes: 表示车道节点的特征
+            - lane_idcs: 车道节点的索引
+            - rpe: relative positional embedding，相对位置误差，用于演员和车道之间的关联
+            - tgt_nodes: 目标节点的特征
+            - tgt_rpe: 目标节点的相对位置误差
+
+        返回:
+        - out: 预测的场景图模型输出
+        """
+
+        # 解包输入数据
         actors, actor_idcs, lanes, lane_idcs, rpe, tgt_nodes, tgt_rpe = data
 
         # * actors/lanes encoding
@@ -598,7 +665,7 @@ class ScenePredNet(nn.Module):
         actor_idcs = gpu(data['ACTOR_IDCS'], self.device)
         lanes = gpu(data['LANES'], self.device)
         lane_idcs = gpu(data['LANE_IDCS'], self.device)
-        rpe = gpu(data['RPE'], self.device)
+        rpe = gpu(data['RPE'], self.device) # rpe: relative positional embedding
         tgt_nodes = gpu(data['TGT_NODES'], self.device)
         tgt_rpe = gpu(data['TGT_RPE'], self.device)
 
