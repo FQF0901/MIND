@@ -137,24 +137,38 @@ class ScenarioTreeGenerator:
         self.target_lane_info = gpu(self.target_lane_info, self.device)
 
     def process_data(self, lcl_smp, agent_obs):
+        """
+        处理agent观察数据和局部样本数据。
+
+        参数:
+        lcl_smp : LocalSample
+            包含环境数据的局部样本。
+        agent_obs : AgentObservation
+            agent的观察数据。
+
+        返回:
+        处理后的数据，供系统使用。
+        """
+        # 获取agent轨迹数据
         trajs_pos, trajs_ang, trajs_vel, trajs_type, has_flags, trajs_tid, trajs_cat = get_agent_trajectories(
             agent_obs, self.device)
 
+        # 获取当前ego agent的速度
         cur_vel = lcl_smp.ego_agent.state[2]
 
-        orig_seq, rot_seq, theta_seq = get_origin_rotation(trajs_pos[0], trajs_ang[0], self.device)  # * target-centric
+        # 获取第一个轨迹的目标位置和旋转序列
+        orig_seq, rot_seq, theta_seq = get_origin_rotation(trajs_pos[0], trajs_ang[0], self.device)
 
-        # ~ get lane graph
+        # 更新车道图
         lane_graph = update_lane_graph_from_argo(lcl_smp.map_data, orig_seq.cpu().numpy(), rot_seq.cpu().numpy())
-
         lane_graph = gpu(from_numpy(lane_graph), self.device)
 
-        # ~ normalize w.r.t. scene
+        # 对轨迹进行场景归一化
         trajs_pos = torch.matmul(trajs_pos - orig_seq, rot_seq)
         trajs_ang = trajs_ang - theta_seq
         trajs_vel = torch.matmul(trajs_vel, rot_seq)
 
-        # ~ normalize trajs
+        # 归一化轨迹数据
         trajs_pos_norm = []
         trajs_ang_norm = []
         trajs_vel_norm = []
@@ -168,12 +182,14 @@ class ScenarioTreeGenerator:
             trajs_ctrs.append(orig_act)
             trajs_vecs.append(torch.tensor([torch.cos(theta_act), torch.sin(theta_act)]))
 
+        # 将归一化的轨迹数据堆叠起来
         trajs_pos = torch.stack(trajs_pos_norm)  # [N, 110(50), 2]
         trajs_ang = torch.stack(trajs_ang_norm)  # [N, 110(50)]
         trajs_vel = torch.stack(trajs_vel_norm)  # [N, 110(50), 2]
         trajs_ctrs = torch.stack(trajs_ctrs).to(self.device)  # [N, 2]
         trajs_vecs = torch.stack(trajs_vecs).to(self.device)  # [N, 2]
 
+        # 创建一个字典来存储轨迹数据
         trajs = dict()
 
         trajs["TRAJS_POS_OBS"] = trajs_pos
@@ -188,8 +204,10 @@ class ScenarioTreeGenerator:
         trajs["TRAJS_TID"] = trajs_tid  # List[str]
         trajs["TRAJS_CAT"] = trajs_cat  # List[str]
 
+        # 获取高层次命令
         tgt_pts, tgt_nodes, tgt_anch = self.get_high_level_command(orig_seq, rot_seq, cur_vel)
 
+        # 计算相对位置误差
         lane_ctrs = lane_graph['lane_ctrs']
         lane_vecs = lane_graph['lane_vecs']
         # ~ calc rpe

@@ -562,7 +562,7 @@ class SceneDecoder(nn.Module):
         - res_aux: 辅助结果列表
         """
         res_cls, res_reg, res_aux = [], [], []
-        # 对目标相对于位置的嵌入进行投影
+        # 对目标相对于位置的嵌入进行投影:high-level commands的target node
         tgt_rpes = self.proj_rpe(tgt_rpes)  # [n_av, 128]
         # 如果目标特征维度为1，增加一个维度
         if len(tgt_feat.shape) == 1:
@@ -584,7 +584,7 @@ class SceneDecoder(nn.Module):
             actor_embed = self.actor_proj(_actors).view(-1, self.num_modes, self.hidden_size).permute(1, 0, 2)
 
             # 初始化目标嵌入，并将第一个目标嵌入设置为投影后的目标特征
-            # 猜测：tgt_embed 可能表示目标车辆的位置和速度？
+            # 猜测：high-level commands的target node
             tgt_embed = torch.zeros_like(actor_embed)
             tgt_embed[0] = tgt[idx].unsqueeze(0)
 
@@ -705,7 +705,7 @@ class ScenePredNet(nn.Module):
         # * actors/lanes encoding
         actors = self.actor_net(actors)  # output: [N_{actor}, 128]
         lanes = self.lane_net(lanes)  # output: [N_{lane}, 128]
-        # tgt encode
+        # tgt encode, 这东西是high-level commands的出来的Target node
         tgt_feat = self.lane_net(tgt_nodes)  # output: [1, 128]
         # * fusion
         actors, lanes, cls = self.fusion_net(actors, actor_idcs, lanes, lane_idcs, rpe)
