@@ -542,8 +542,8 @@ class SceneDecoder(nn.Module):
 
     def forward(self,
                 ctx: torch.Tensor,  # 交通上下文特征
-                actors: torch.Tensor,   # 交互对象特征
-                actor_idcs: List[Tensor],   # 交互对象索引列表
+                actors: torch.Tensor,   # agent特征
+                actor_idcs: List[Tensor],   # agent索引列表
                 tgt_feat: torch.Tensor, # 目标特征
                 tgt_rpes: torch.Tensor):    # 目标相对于位置的嵌入
         """
@@ -551,8 +551,8 @@ class SceneDecoder(nn.Module):
 
         参数:
         - ctx: 交通上下文特征，类型为torch.Tensor
-        - actors: 交互对象特征，类型为torch.Tensor
-        - actor_idcs: 交互对象索引列表，类型为List[Tensor]
+        - actors: agent特征，类型为torch.Tensor
+        - actor_idcs: agent索引列表，类型为List[Tensor]
         - tgt_feat: 目标特征，类型为torch.Tensor
         - tgt_rpes: 目标相对于位置的嵌入，类型为torch.Tensor
 
@@ -571,35 +571,48 @@ class SceneDecoder(nn.Module):
         # 对目标特征和相对位置嵌入的组合进行投影
         tgt = self.proj_tgt(torch.cat([tgt_feat, tgt_rpes], dim=-1))
 
-        # 遍历每个交互对象索引，进行特征嵌入和预测
+        # 遍历每个agent索引，进行特征嵌入和预测
         for idx, a_idcs in enumerate(actor_idcs):
             _ctx = ctx[idx].unsqueeze(0)    # 获取当前交通上下文并调整维度
-            _actors = actors[a_idcs]    # 获取当前交互对象特征
+            _actors = actors[a_idcs]    # 获取当前agent特征
 
             # 对交通上下文进行投影并调整维度，然后进行饱和处理
             cls_embed = self.ctx_proj(_ctx).view(-1, self.num_modes, self.hidden_size).permute(1, 0, 2)
             cls_embed = self.ctx_sat(cls_embed)
 
-            # 对交互对象特征进行投影并调整维度
+            # 对agent特征进行投影并调整维度
             actor_embed = self.actor_proj(_actors).view(-1, self.num_modes, self.hidden_size).permute(1, 0, 2)
 
             # 初始化目标嵌入，并将第一个目标嵌入设置为投影后的目标特征
+            # 猜测：tgt_embed 可能表示目标车辆的位置和速度？
             tgt_embed = torch.zeros_like(actor_embed)
             tgt_embed[0] = tgt[idx].unsqueeze(0)
 
-            # 结合交通上下文、交互对象和目标嵌入，进行分类和回归预测
+            # 结合交通上下文、agent和目标嵌入，进行分类和回归预测
             embed = cls_embed + actor_embed + tgt_embed
             cls = self.cls(cls_embed).view(self.num_modes, -1)
 
             # 根据不同的输出参数，计算回归参数、速度和协方差
             if self.param_out == 'bezier':
+                # 通过 self.reg 层处理 embed 向量，然后将其重塑为形状 (num_modes, -1, N_ORDER + 1, 5) 的张量
+                # param 包含了不同模式下的贝塞尔曲线参数，每个模式有 N_ORDER + 1 个控制点，每个控制点有 5 个参数
                 param = self.reg(embed).view(self.num_modes, -1, self.N_ORDER + 1, 5)
+
+                # 作用：提取 param 中前两个维度的数据，即位置参数，并重新排列维度顺序。
+                # 物理意义：reg_param 包含了位置参数，每个控制点有 2 个位置坐标。
                 reg_param = param[..., :2]
                 reg_param = reg_param.permute(1, 0, 2, 3)
-                reg = torch.matmul(self.mat_T, reg_param)
-                vel = torch.matmul(self.mat_Tp, torch.diff(reg_param, dim=2)) / (self.future_steps * 0.1)
+
+                # reg 可以被看作是未来位置的一个预测或表示
+                reg = torch.matmul(self.mat_T, reg_param)   # 矩阵乘法 torch.matmu
+                vel = torch.matmul(self.mat_Tp, torch.diff(reg_param, dim=2)) / (self.future_steps * 0.1)   # 通过矩阵乘法 torch.matmul 和差分 torch.diff 计算速度 vel
+
+                # 作用：提取 param 中从第三个维度开始的数据，即协方差参数，并重新排列维度顺序。
+                # 物理意义：cov_param 包含了协方差参数，每个控制点有 3 个协方差参数
                 cov_param = param[..., 2:]
                 cov_param = cov_param.permute(1, 0, 2, 3)
+
+                # 计算 协方差cov 和 协方差速度cov_vel
                 cov = torch.matmul(self.mat_T, cov_param)
                 cov_vel = torch.matmul(self.mat_Tp, torch.diff(cov_param, dim=2)) / (self.future_steps * 0.1)
 
