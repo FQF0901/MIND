@@ -36,24 +36,41 @@ class ScenarioTreeGenerator:
         self.tree = Tree()
 
     def branch_aime(self, lcl_smp, agent_obs):
-        # Initialization
+        """
+        执行AIME算法，通过迭代预测、剪枝、合并和分支构建场景树。
+
+        参数:
+        - lcl_smp: 本地样本信息，用于数据处理。
+        - agent_obs: 环境中代理的观察信息，作为场景预测的输入。
+
+        返回:
+        - 构建好的场景树，旨在通过预测和分析场景来提供决策依据。
+        """
+
+        # Initialization phase:处理输入数据并初始化场景树
         data = self.process_data(lcl_smp, agent_obs)
         self.init_scenario_tree(data)
-        # AIME iteration
+
+        # AIME iteration:持续执行直到没有节点可分支
         branch_nodes = self.get_branch_set()
         while branch_nodes:
-            # Batch Scenario Prediction
+            # Batch Scenario Prediction: 收集当前分支节点的观察数据进行批量处理和预测
             data_batch = collate_fn([node.data.obs_data for node in branch_nodes])
-            pred_batch = self.predict_scenes(data_batch)
-            # Pruning & Merging
+            pred_batch = self.predict_scenes(data_batch)    # 通过网络模型进行场景预测
+
+            # Pruning & Merging: 根据预测结果，剪枝不可能的场景并合并相似的场景
             pred_bar = self.prune_merge(data_batch, pred_batch)
-            # Create New Nodes (slightly different from the pseudocode in paper)
+
+            # Create New Nodes: 根据剪枝和合并后的预测结果，在场景树中创建新节点
             self.create_nodes(pred_bar)
-            # Branching Decision on newly added node
+
+            # Branching Decision: 对新添加的节点进行分支决策，扩展场景树
             self.decide_branch()
-            # Update Branch Set
+
+            # Update Branch Set: 更新待分支的节点集，准备下一轮迭代
             branch_nodes = self.get_branch_set()
 
+        # 确保场景树至少有一个结束节点，表示场景发展完成
         assert len(self.get_end_set()) > 0, "No end node found in the scenario tree."
         return self.get_scenario_tree()
 
@@ -67,8 +84,8 @@ class ScenarioTreeGenerator:
         self.decide_branch()
 
     def predict_scenes(self, data):
-        data_in = self.network.pre_process(data)
-        return self.network(data_in)
+        data_in = self.network.pre_process(data)    # 对输入数据进行预处理
+        return self.network(data_in)    # 通过网络模型进行场景预测
 
     def create_nodes(self, pred_bar):
         for pred in pred_bar:

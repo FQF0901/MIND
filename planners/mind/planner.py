@@ -56,6 +56,8 @@ class MINDPlanner:
         net_file, net_name = net_cfg['network'].split(':')
         
         # 根据网络模块文件和类名动态导入并实例化网络模型
+        # getattr(module, net_name): 从导入的模块（module）中通过属性名（net_name，通常也是一个字符串）获取对应的类或对象
+        # getattr 是 Python 中的一个内置函数，用于从对象中获取属。当需要根据运行时的数据来决定访问哪个属性时，getattr 非常有用
         self.network = getattr(import_module(net_file), net_name)(net_cfg, self.device)
         
         # self.planner_cfg['ckpt_path']：这是一个字符串，表示模型检查点文件的路径
