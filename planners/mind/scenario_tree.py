@@ -340,53 +340,68 @@ class ScenarioTreeGenerator:
             cur_t = data['CUR_T'][idx]  # Current Time
             end_t = data['END_T'][idx]  # End Time
 
+            # 提取并分离当前索引的回归、分类和速度结果
             res_reg = res_reg_batch[idx].detach()
             res_cls = res_cls_batch[idx].detach()
             res_vel = res_aux_batch[idx][0].detach()
+            # 计算速度向量的角度
             res_ang = get_angle(res_vel)
 
-            # sort the scene by the probability
+            # sort the scene by the probability. 根据概率对场景进行排序
             scene_idcs = torch.argsort(res_cls, dim=1, descending=True)[0]
 
+            # 初始化数据候选列表
             data_candidates = []
 
+            # 遍历排序后的场景索引
             for scene_id in scene_idcs:
+                # 提取当前场景的概率
                 scene_prob = res_cls[0, scene_id]
 
+                # 构造场景ID
                 scen_id = "{}_{}_{}".format(self.branch_depth, idx, scene_id)
 
+                # 提取当前位置、协方差和速度的预测结果
                 trajs_pos_pred = res_reg[:, scene_id, :, :2]
                 # trajs_cov_pred = get_covariance_matrix(res_reg[:, scene_id, :, 2:])
                 trajs_cov_pred = get_max_covariance(res_reg[:, scene_id, :, 2:])  # use the max sigma
                 trajs_vel_pred = res_vel[:, scene_id]
 
+                # 计算轨迹的角度和旋转矩阵
                 trajs_theta = torch.atan2(trajs_vecs[:, 1], trajs_vecs[:, 0])
                 trajs_rots = torch.stack([torch.cos(trajs_theta), -torch.sin(trajs_theta),
                                           torch.sin(trajs_theta), torch.cos(trajs_theta)], dim=1).view(-1, 2, 2)
 
+                # 对每个轨迹进行坐标系对齐和位置偏移
                 for i in range(len(trajs_pos_pred)):
                     trajs_pos_pred[i] = torch.matmul(trajs_pos_pred[i], trajs_rots[i].transpose(-1, -2)) + trajs_ctrs[i]
                     trajs_vel_pred[i] = torch.matmul(trajs_vel_pred[i], trajs_rots[i].transpose(-1, -2))
                     # trajs_cov_pred[i] = torch.matmul(trajs_rots[i],
                     #                                  torch.matmul(trajs_cov_pred[i], trajs_rots[i].transpose(-1, -2)))
 
+                # 将预测结果转换到全局坐标系
                 trajs_pos_pred = torch.matmul(trajs_pos_pred, rot.T) + orig
                 trajs_vel_pred = torch.matmul(trajs_vel_pred, rot.T)
                 # trajs_cov_pred = torch.matmul(rot, torch.matmul(trajs_cov_pred, rot.T))
+
+                # 更新预测的角度
                 trajs_ang_pred = res_ang[:, scene_id] + trajs_theta.unsqueeze(1) + theta_global
 
                 trajs_cov_pred += trajs_cov_hist[:, -1].unsqueeze(1)
 
+                # 将预测结果与历史数据合并
                 trajs_pos_hist_new = torch.cat([trajs_pos_hist, trajs_pos_pred], dim=1)[:, :self.seq_len]
                 trajs_cov_hist_new = torch.cat([trajs_cov_hist, trajs_cov_pred], dim=1)[:, :self.seq_len]
                 trajs_ang_hist_new = torch.cat([trajs_ang_hist, trajs_ang_pred], dim=1)[:, :self.seq_len]
                 trajs_vel_hist_new = torch.cat([trajs_vel_hist, trajs_vel_pred], dim=1)[:, :self.seq_len]
 
+                # 构造当前轨迹数据字典
                 cur_traj_data = dict()
                 cur_traj_data["TRAJS_TYPE"] = trajs_type
                 cur_traj_data["TRAJS_TID"] = trajs_tid
                 cur_traj_data["TRAJS_CAT"] = trajs_cat
 
+                # 构造当前场景数据字典
                 cur_data = {}
                 cur_data["SCEN_PROB"] = scene_prob * parent_prob
                 cur_data["CUR_T"] = cur_t
@@ -400,11 +415,11 @@ class ScenarioTreeGenerator:
                 cur_data['TRAJS_VEL_HIST'] = trajs_vel_hist_new
                 cur_data['TGT_PTS'] = data['TGT_PTS'][idx]
 
-                # prune if the scene is not likely
+                # prune if the scene is not likely. 如果场景概率过低，则忽略
                 if cur_data["SCEN_PROB"] < 0.001:
                     continue
 
-                # prune if the ego decision is not likely to follow the target lane
+                # prune if the ego decision is not likely to follow the target lane. 如果目标车道和自我索引存在，且自我决策偏离目标车道，则忽略
                 if self.target_lane is not None and self.ego_idx is not None:
                     ego_mean = cur_data['TRAJS_POS_HIST'][self.ego_idx][-1]
                     ego_cov = cur_data['TRAJS_COV_HIST'][self.ego_idx][-1]
@@ -413,10 +428,10 @@ class ScenarioTreeGenerator:
                     if dis - ego_cov > self.config.tar_dist_thres:
                         continue
 
-                # cal the topo cum change for merging
+                # cal the topo cum change for merging. 计算拓扑累积变化用于合并
                 topos = torch.zeros(len(trajs_pos_pred) - 1)
                 for iii, traj in enumerate(trajs_pos_pred[1:]):
-                    # cal the cum angle change of the vector pointing from ego to the exo
+                    # cal the cum angle change of the vector pointing from ego to the exo. 计算从 ego 到 exogenous 的向量的角度累积变化
                     vec = traj - trajs_pos_pred[0]
                     vec = vec / torch.norm(vec, dim=-1, keepdim=True)
                     ang = torch.atan2(vec[:, 1], vec[:, 0])
@@ -426,9 +441,10 @@ class ScenarioTreeGenerator:
                     # cal the cum angle change of the vector pointing from ego to the exo
                     topos[iii] = torch.sum(ang_diff)
 
+                # 将当前数据候选添加到列表中
                 data_candidates.append([cur_data, scene_prob, topos])
 
-            # merge the similar scenes
+            # merge the similar scenes. 合并相似场景
             selected_data = []
             min_topo_change = torch.pi / 6  # delta
             while len(data_candidates) > 0:
@@ -646,42 +662,64 @@ class ScenarioTreeGenerator:
         return end_t
 
     def get_high_level_command(self, orig, rot, cur_vel, min_vel=0.5):
-        # get tgt lane
+        """
+        根据当前状态和目标车道信息，生成高级行为命令。
+
+        参数:
+        - orig: 起始点坐标
+        - rot: 旋转矩阵，用于坐标转换
+        - cur_vel: 当前速度
+        - min_vel: 最小速度，默认值为0.5
+
+        返回:
+        - tgt_pts: 目标车道点列表
+        - tgt_nodes: 目标节点信息，包含中心点、向量和车道信息
+        - tgt_anch: 目标锚点和向量
+        """
+
+        # get tgt lane: 计算目标车道上每一点到起始点的距离
         dists = torch.norm(self.target_lane - orig, dim=-1)
-        # get the closest target lane point
+        # get the closest target lane point: 找到距离最近的目标车道点索引
         closest_idx = torch.argmin(dists)
-        # get current mind
+        # 根据当前速度和预测时间计算将要行驶的距离
         travel_dist = max(cur_vel, min_vel) * self.config.tar_time_ahead
-        # get approximation of the future area idx
+        # get approximation of the future area idx: 初始化目标点索引为最近点索引
         target_idx = closest_idx
+        # 根据行驶距离调整目标点索引
         while target_idx < len(self.target_lane) - 1 and travel_dist > 0:
             target_idx += 1
             travel_dist -= torch.norm(self.target_lane[target_idx] - self.target_lane[target_idx - 1])
 
+        # 确保目标点索引不在车道的最后五个点内
         if target_idx == len(self.target_lane) - 1:
             target_idx -= 1
-
         target_idx = max(5, min(target_idx, len(self.target_lane) - 6))
-        selected_idx = torch.arange(target_idx - 5, target_idx + 6)
 
+        # 选取目标车道点及其信息
+        selected_idx = torch.arange(target_idx - 5, target_idx + 6)
         target_lane_pts = self.target_lane[selected_idx]
         target_lane_info = self.target_lane_info[selected_idx][1:]
 
         tgt_pts = copy.deepcopy(target_lane_pts)
         assert len(target_lane_pts) == 11
 
+        # 复制并转换目标车道点到局部坐标系
         ctrln = copy.deepcopy(target_lane_pts)  # [num_sub_segs + 1, 2]
-        ctrln = torch.matmul(ctrln - orig, rot)  # to local frame
+        ctrln = torch.matmul(ctrln - orig, rot) # to local frame
+
+        # 计算锚点位置和向量
         anch_pos = torch.mean(ctrln, dim=0)
         anch_vec = (ctrln[-1] - ctrln[0]) / torch.norm(ctrln[-1] - ctrln[0])
         anch_rot = torch.tensor([[anch_vec[0], -anch_vec[1]],
                                  [anch_vec[1], anch_vec[0]]]).to(self.device)
-        ctrln = torch.matmul(ctrln - anch_pos, anch_rot)  # to instance frame
+        ctrln = torch.matmul(ctrln - anch_pos, anch_rot)    # to instance frame
+
+        # 计算中心点和向量
         ctrs = (ctrln[:-1] + ctrln[1:]) / 2.0
         vecs = ctrln[1:] - ctrln[:-1]
         tgt_anch = [anch_pos, anch_vec]
 
-        # convert to tensor
+        # convert to tensor: 合并目标节点信息
         # ~ calc tgt feat
-        tgt_nodes = torch.cat([ctrs, vecs, target_lane_info], dim=-1)  # [N_{lane}, 16, F]
+        tgt_nodes = torch.cat([ctrs, vecs, target_lane_info], dim=-1)   # [N_{lane}, 16, F]
         return tgt_pts, tgt_nodes, tgt_anch
