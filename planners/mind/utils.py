@@ -139,12 +139,12 @@ def actor_gather(batch_size, trajs):
     return actors, actor_idcs
 
 
-def collate_fn(batch: List[Any]) -> Dict[str, Any]:
+def collate_fn(batch: List[Any]) -> Dict[str, Any]: # batch 是一个列表，包含了多个数据样本。数据样本的类型为 Any，可以是任意类型
     if len(batch) == 0:
         return None
     batch = from_numpy(batch)
     data = dict()
-    data['BATCH_SIZE'] = len(batch)
+    data['BATCH_SIZE'] = len(batch) # 创建一个空字典 data，并添加一个键 'BATCH_SIZE'，其值为当前批次的大小（样本数量）
     # Batching by use a list for non-fixed size
     for key in batch[0].keys():
         data[key] = [x[key] for x in batch]
@@ -155,9 +155,9 @@ def collate_fn(batch: List[Any]) -> Dict[str, Any]:
         'TRAJS', 'LANE_GRAPH', 'RPE'
     '''
 
-    actors, actor_idcs = actor_gather(data['BATCH_SIZE'], data['TRAJS'])
-    lanes, lane_idcs = graph_gather(data['BATCH_SIZE'], data["LANE_GRAPH"])
-    tgt_nodes, tgt_rpe = tgt_gather(data['BATCH_SIZE'], data['TGT_NODES'], data['TGT_RPE'])
+    actors, actor_idcs = actor_gather(data['BATCH_SIZE'], data['TRAJS'])    # 根据批次大小和轨迹信息（TRAJS）聚合演员数据
+    lanes, lane_idcs = graph_gather(data['BATCH_SIZE'], data["LANE_GRAPH"]) # 根据批次大小和车道图信息（LANE_GRAPH）聚合车道数据
+    tgt_nodes, tgt_rpe = tgt_gather(data['BATCH_SIZE'], data['TGT_NODES'], data['TGT_RPE']) # 根据批次大小和目标节点及其相关信息（TGT_NODES 和 TGT_RPE）聚合目标数据
 
     data['ACTORS'] = actors
     data['ACTOR_IDCS'] = actor_idcs

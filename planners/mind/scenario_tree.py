@@ -55,11 +55,11 @@ class ScenarioTreeGenerator:
         branch_nodes = self.get_branch_set()
         while branch_nodes:
             # Batch Scenario Prediction: 收集当前分支节点的观察数据进行批量处理和预测
-            data_batch = collate_fn([node.data.obs_data for node in branch_nodes])
-            pred_batch = self.predict_scenes(data_batch)    # 通过网络模型进行场景预测，这里得到的应该是每个agent的res_cls, res_reg, res_aux
+            data_batch = collate_fn([node.data.obs_data for node in branch_nodes])  # data_batch包含了agent、lane、和target信息
+            pred_batch = self.predict_scenes(data_batch)    # 通过网络模型进行场景预测，这里得到的是预测每个agent的res_cls, res_reg, res_aux
 
             # Pruning & Merging: 根据预测结果，剪枝不可能的场景并合并相似的场景
-            pred_bar = self.prune_merge(data_batch, pred_batch)
+            pred_bar = self.prune_merge(data_batch, pred_batch) # 两个输入：当前信息data_batch 和 预测结果pred_batch
 
             # Create New Nodes: 根据剪枝和合并后的预测结果，在场景树中创建新节点
             self.create_nodes(pred_bar)
@@ -344,10 +344,10 @@ class ScenarioTreeGenerator:
             cur_t = data['CUR_T'][idx]  # Current Time
             end_t = data['END_T'][idx]  # End Time
 
-            # 提取并分离当前索引的回归、分类和速度结果
-            res_reg = res_reg_batch[idx].detach()
-            res_cls = res_cls_batch[idx].detach()
-            res_vel = res_aux_batch[idx][0].detach()
+            # 提取并分离当前索引的回归、分类和速度结果（这3个都是预测网给出的）
+            res_reg = res_reg_batch[idx].detach()   # 表示对于每个预测模式的具体轨迹参数。这些参数描述了预测轨迹的具体形状或位置信息，例如位置坐标、速度等
+            res_cls = res_cls_batch[idx].detach()   # 表示对于每个模式（mode）的分类概率。具体来说，它包含了模型对不同未来轨迹模式的概率分布估计
+            res_vel = res_aux_batch[idx][0].detach()    # 提供了额外的信息来辅助理解或评估回归结果。具体来说，它包含了预测轨迹的速度（vel）、协方差（cov_vel）等
             # 计算速度向量的角度
             res_ang = get_angle(res_vel)
 
@@ -419,48 +419,56 @@ class ScenarioTreeGenerator:
                 cur_data['TRAJS_VEL_HIST'] = trajs_vel_hist_new
                 cur_data['TGT_PTS'] = data['TGT_PTS'][idx]
 
-                # prune if the scene is not likely. 如果场景概率过低，则忽略
+                # 1. prune if the scene is not likely. 如果场景概率过低，则忽略
                 if cur_data["SCEN_PROB"] < 0.001:
                     continue
 
-                # prune if the ego decision is not likely to follow the target lane. 如果目标车道和自我索引存在，且自我决策偏离目标车道，则忽略
-                if self.target_lane is not None and self.ego_idx is not None:
-                    ego_mean = cur_data['TRAJS_POS_HIST'][self.ego_idx][-1]
+                # 2. prune if the ego decision is not likely to follow the target lane. 
+                # 如果自车决策没有遵循目标路线，则进行修剪。这段代码帮助确保自车在控制和导航时保持在目标车道附近，但可能有点不合适，因为貌似难以处理倒车避让场景
+                if self.target_lane is not None and self.ego_idx is not None:   # 确保存在目标车道和自车的索引
+                    # 提取自车当前的平均位置（ego_mean）和不确定性（ego_cov），反映自车状态的精确度和稳定性
+                    ego_mean = cur_data['TRAJS_POS_HIST'][self.ego_idx][-1] 
                     ego_cov = cur_data['TRAJS_COV_HIST'][self.ego_idx][-1]
 
-                    dis = get_distance_to_polyline(self.target_lane, ego_mean)
-                    if dis - ego_cov > self.config.tar_dist_thres:
+                    dis = get_distance_to_polyline(self.target_lane, ego_mean)  # 计算自车位置到目标车道的最短距离，帮助判断自车与车道的关系
+                    if dis - ego_cov > self.config.tar_dist_thres:  # 判断自车到车道的距离是否超过了一个阈值
                         continue
 
-                # cal the topo cum change for merging. 计算拓扑累积变化用于合并
-                topos = torch.zeros(len(trajs_pos_pred) - 1)
-                for iii, traj in enumerate(trajs_pos_pred[1:]):
+                # 3.1 al the topo cum change for merging. 计算拓扑累积变化用于合并
+                topos = torch.zeros(len(trajs_pos_pred) - 1)    # 用于存储每个轨迹段之间的累计角度变化，帮助后续分析车辆的转向行为
+                for iii, traj in enumerate(trajs_pos_pred[1:]): # 遍历每个预测的轨迹，从第二个轨迹开始，目的是分析每段轨迹与起始轨迹之间的关系
                     # cal the cum angle change of the vector pointing from ego to the exo. 计算从 ego 到 exogenous 的向量的角度累积变化
                     vec = traj - trajs_pos_pred[0]
-                    vec = vec / torch.norm(vec, dim=-1, keepdim=True)
-                    ang = torch.atan2(vec[:, 1], vec[:, 0])
-                    ang_diff = ang[1:] - ang[:-1]
+                    vec = vec / torch.norm(vec, dim=-1, keepdim=True)   # 将向量归一化，使其长度为1，便于只关注方向，而不受距离影响
+                    ang = torch.atan2(vec[:, 1], vec[:, 0]) # 通过计算向量的角度，获取其与x轴的夹角，表示自车相对于目标的方向
+                    ang_diff = ang[1:] - ang[:-1]   # 计算相邻向量之间的角度差，反映车辆在行驶过程中转向的变化
                     # normalize the angle diff
-                    ang_diff = torch.atan2(torch.sin(ang_diff), torch.cos(ang_diff))
+                    ang_diff = torch.atan2(torch.sin(ang_diff), torch.cos(ang_diff))    # 归一化角度差，确保角度在 -π 到 π 之间，避免跨越180度时出现错误
                     # cal the cum angle change of the vector pointing from ego to the exo
-                    topos[iii] = torch.sum(ang_diff)
+                    topos[iii] = torch.sum(ang_diff)    # 将每段轨迹的角度变化累加，表示自车在行驶过程中总的转向变化，帮助分析其运动模式和稳定性
 
                 # 将当前数据候选添加到列表中
                 data_candidates.append([cur_data, scene_prob, topos])
 
-            # merge the similar scenes. 合并相似场景
+            # 3.2 merge the similar scenes. 合并相似场景
             selected_data = []
-            min_topo_change = torch.pi / 6  # delta
-            while len(data_candidates) > 0:
+            min_topo_change = torch.pi / 6  # delta 设置一个阈值（30度），用于限制所选择数据之间的角度变化，确保选出的数据在方向上较为一致
+
+            while len(data_candidates) > 0: # 在候选数据仍有剩余时，不断进行筛选，以获得一组满足条件的数据
                 select_data, select_prob, select_topos = data_candidates[0]
-                selected_data.append(select_data)
+                selected_data.append(select_data)   # 从候选数据中选取第一个数据并将其添加到已选择的数据集中
                 data_candidates_tmp = []
                 for data_candidate in data_candidates[1:]:
                     _, _, res_topos = data_candidate
+
+                    # 1. 计算已选择数据与其他候选数据之间的拓扑差异，归一化角度变化，确保其在有效范围内，反映出两者的相对方向变化
                     topos_diff = select_topos - res_topos
                     topos_diff = torch.atan2(torch.sin(topos_diff), torch.cos(topos_diff))
+
+                    # 2. 只保留那些与已选择数据的拓扑变化超过阈值的数据，从而确保选出的数据集在方向上保持一致
                     if torch.sum((torch.abs(topos_diff) - min_topo_change) > 0) > 0:
                         data_candidates_tmp.append(data_candidate)
+
                 data_candidates = data_candidates_tmp
             data_interact += selected_data
 
