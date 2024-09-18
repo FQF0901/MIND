@@ -254,16 +254,16 @@ class MINDPlanner:
 
         # 遍历目标车道中的每一段
         for i in range(len(lcl_smp.target_lane) - 1):
-            # 获取当前车道段
+            # 获取目标车道段
             lane_segment = lcl_smp.target_lane[i:i + 2]
-            # 计算当前车道段的长度
+            # 计算目标车道段的长度
             lane_segment_len = np.linalg.norm(lane_segment[0] - lane_segment[1])
-            # 计算当前车道段所需的采样点数
+            # 计算目标车道段所需的采样点数
             num_sample = int(np.ceil(lane_segment_len / 1.0))
-            # 重新采样当前车道段
+            # 重新采样目标车道段
             for j in range(num_sample):
                 alpha = j / num_sample
-                resample_target_lane.append(lane_segment[0] + alpha * (lane_segment[1] - lane_segment[0]))
+                resample_target_lane.append(lane_segment[0] + alpha * (lane_segment[1] - lane_segment[0]))  # 啥意思？一阶滤波？
                 # 重新采样对应的车道信息
                 for k, info in enumerate(lcl_smp.target_lane_info):
                     resample_target_lane_info[k].append(info[i])

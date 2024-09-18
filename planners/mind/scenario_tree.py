@@ -56,7 +56,7 @@ class ScenarioTreeGenerator:
         while branch_nodes:
             # Batch Scenario Prediction: 收集当前分支节点的观察数据进行批量处理和预测
             data_batch = collate_fn([node.data.obs_data for node in branch_nodes])
-            pred_batch = self.predict_scenes(data_batch)    # 通过网络模型进行场景预测
+            pred_batch = self.predict_scenes(data_batch)    # 通过网络模型进行场景预测，这里得到的应该是每个agent的res_cls, res_reg, res_aux
 
             # Pruning & Merging: 根据预测结果，剪枝不可能的场景并合并相似的场景
             pred_bar = self.prune_merge(data_batch, pred_batch)
@@ -125,7 +125,11 @@ class ScenarioTreeGenerator:
         return branch_set
 
     def set_target_lane(self, target_lane, target_lane_info):
+        # 这个 gpu 函数可以递归处理不同类型的数据结构，并将其中的所有张量移动到指定的 GPU 设备上
         self.target_lane = gpu(torch.from_numpy(np.array(target_lane)), self.device)
+
+        # unsqueeze用于在指定的位置向张量中添加一个新的维度。例如一个形状为 [N] 的一维张量，使用 unsqueeze(1) 会将其转换为 [N, 1] 的二维张量
+        # torch.cat 是 PyTorch 中的一个函数，用于将多个张量沿着最后一个维度（dim=-1）连接起来
         self.target_lane_info = torch.cat([torch.from_numpy(target_lane_info[0]).unsqueeze(1),
                                            torch.from_numpy(target_lane_info[1]),
                                            torch.from_numpy(target_lane_info[2]),

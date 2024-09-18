@@ -11,11 +11,11 @@ def gpu(data, device):
     Transfer tensor in `data` to gpu recursively
     `data` can be dict, list or tuple
     """
-    if isinstance(data, list) or isinstance(data, tuple):
+    if isinstance(data, list) or isinstance(data, tuple):   # 列表或元组
         data = [gpu(x, device=device) for x in data]
-    elif isinstance(data, dict):
+    elif isinstance(data, dict):    # 字典
         data = {key: gpu(_data, device=device) for key, _data in data.items()}
-    elif isinstance(data, torch.Tensor):
+    elif isinstance(data, torch.Tensor):    # 张量
         data = data.contiguous().to(device, non_blocking=True)
     return data
 
