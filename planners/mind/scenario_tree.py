@@ -98,20 +98,25 @@ class ScenarioTreeGenerator:
 
     def decide_branch(self):
         # iterate over the leaf nodes
-        for l in self.tree.get_leaf_nodes():
+        for l in self.tree.get_leaf_nodes():    # 获取树中的所有叶节点，意味着要检查每个节点的状态以决定其在树中的角色
+
+            # 1. 更新分支和终止标志。如果叶节点已经是一个分支节点，则将其标记为终止。这反映了对树结构动态管理的需求，避免重复分支
             if l.data.branch_flag:
                 l.data.branch_flag = False
                 l.data.terminate_flag = True
+
+            # 2. 深度检查。限制树的高度以控制复杂度。达到最大深度时，节点标记为终止，确保树的形状不会无限扩展
             elif not l.data.end_flag:
                 if l.depth >= self.config.max_depth:
                     l.data.terminate_flag = True
                 else:
+                    # 3. 计算该节点的分支时间，评估是否应该继续向下分支，反映了时间对决策的影响
                     t_b = self.get_branch_time(l.data.data)
                     if t_b < self.pred_len:
-                        # Update the observation data
+                        # Update the observation data. 更新节点的数据，可能反映出新的观测结果，从而影响后续的决策过程
                         l.data.obs_data, l.data.data = self.update_obser(l.data.data)
                         # Add node to branch set
-                        l.data.branch_flag = True
+                        l.data.branch_flag = True   # 如果节点的分支时间小于预测长度，则将其标记为分支，反之则标记为结束。这反映出时间和状态变化对决策的影响
                     else:
                         # Add node the end set
                         l.data.end_flag = True
