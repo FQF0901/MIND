@@ -270,31 +270,50 @@ class RelaFusionNet(nn.Module):
 
 class FusionNet(nn.Module):
     def __init__(self, device, config):
-        super(FusionNet, self).__init__()
-        self.device = device
+        """
+        初始化FusionNet模型类。
 
+        该构造函数初始化了模型所需的设备信息、嵌入维度、相对位置编码维度等配置，
+        并定义了用于对演员（actor）和车道（lane）特征进行投影的线性层，以及场景融合网络。
+
+        参数:
+        - device: 字符串，指示模型在哪个设备（如'cpu'或'cuda'）上运行。
+        - config: 字典，包含模型的各种配置参数，如嵌入维度d_embed，相对位置编码维度d_rpe，
+            dropout率，是否更新边等。
+
+        返回值:
+        无
+        """
+        super(FusionNet, self).__init__()  # 调用父类构造方法
+        self.device = device  # 设置模型运行的设备
+
+        # 从配置字典中提取相关维度和参数
         self.d_embed = config['d_embed']
         self.d_rpe = config['d_rpe']
-        self.d_model = config['d_embed']
-        dropout = config['dropout']
-        update_edge = config['update_edge']
+        self.d_model = config['d_embed']  # 设置模型维度
+        dropout = config['dropout']  # 提取dropout率
+        update_edge = config['update_edge']  # 提取是否更新边的信息
 
+        # 1. 定义用于演员特征投影的线性层和归一化层
         self.proj_actor = nn.Sequential(
             nn.Linear(config['d_actor'], self.d_model),
             nn.LayerNorm(self.d_model),
             nn.ReLU(inplace=True)
         )
+        # 2. 定义用于车道特征投影的线性层和归一化层
         self.proj_lane = nn.Sequential(
             nn.Linear(config['d_lane'], self.d_model),
             nn.LayerNorm(self.d_model),
             nn.ReLU(inplace=True)
         )
+        # 3. 定义用于相对位置编码投影的线性层和归一化层
         self.proj_rpe_scene = nn.Sequential(
             nn.Linear(config['d_rpe_in'], config['d_rpe']),
             nn.LayerNorm(config['d_rpe']),
             nn.ReLU(inplace=True)
         )
 
+        # 4. 初始化场景融合网络
         self.fuse_scene = RelaFusionNet(self.device,
                                         d_model=self.d_model,
                                         d_edge=config['d_rpe'],
@@ -309,44 +328,83 @@ class FusionNet(nn.Module):
                 lanes: Tensor,
                 lane_idcs: List[Tensor],
                 rpe_prep: Dict[str, Tensor]):
-        # projection
+        """
+        前向传播函数，用于处理输入的演员和车道数据，并融合场景信息。
+
+        :param actors: 输入的演员数据张量
+        :param actor_idcs: 演员数据的索引列表
+        :param lanes: 输入的车道数据张量
+        :param lane_idcs: 车道数据的索引列表
+        :param rpe_prep: 相对位置嵌入的预处理数据字典
+        :return: 处理后的演员数据、车道数据和分类信息
+        """
+        # 对演员和车道数据进行投影
         actors = self.proj_actor(actors)
         lanes = self.proj_lane(lanes)
 
+        # 初始化新的数据列表
         actors_new, lanes_new, cls_new = list(), list(), list()
 
+        # 遍历每个样本的演员和车道数据，进行融合处理
         for a_idcs, l_idcs, rpes in zip(actor_idcs, lane_idcs, rpe_prep):
-            # * fusion - scene
+            # 获取当前样本的演员和车道数据
             _actors = actors[a_idcs]
             _lanes = lanes[l_idcs]
+            # 将演员和车道数据合并，完全是SIMPL的架构
             tokens = torch.cat([_actors, _lanes], dim=0)
+
+            # 创建CLS标记(Classification Token)，并将其添加到合并的数据中, 此处借鉴BERT的架构
+            # CLS标记是一个额外的输入标记，用于帮助模型学习整个输入序列的全局特征，通常用于分类任务
             cls_token = torch.zeros((1, self.d_model), device=self.device)
             tokens_with_cls = torch.cat([tokens, cls_token], dim=0)
 
+            # 对相对位置嵌入进行投影，并调整形状
             rpe = self.proj_rpe_scene(rpes['scene'].permute(1, 2, 0))
+            # 创建包含CLS的相对位置嵌入矩阵
+            # 这段代码的主要目的是扩展相对位置编码（Relative Positional Encoding, RPE）以包含CLS标记，因为：
+            # 1. 在序列tokens中加入CLS标记后，整个序列tokens_with_cls的长度变长了。
+            # 2. 相对位置编码也需要相应地扩展，以包含CLS标记的位置信息。
             rpe_with_cls = torch.zeros(
                 (tokens_with_cls.shape[0], tokens_with_cls.shape[0], self.d_rpe),
                 device=self.device)
             rpe_with_cls[:tokens.shape[0], :tokens.shape[0], :] = rpe
 
+            # 使用融合模块处理数据和相对位置嵌入
             out, _ = self.fuse_scene(tokens_with_cls, rpe_with_cls, edge_mask=None)
 
+            # 将处理结果分别添加到对应的列表中
             actors_new.append(out[:len(a_idcs)])
             lanes_new.append(out[len(a_idcs):-1])
             cls_new.append(out[-1].unsqueeze(0))
+
+        # 将所有样本的数据合并
         actors = torch.cat(actors_new, dim=0)
         lanes = torch.cat(lanes_new, dim=0)
         cls = torch.cat(cls_new, dim=0)
+
         return actors, lanes, cls
 
 
 class SceneDecoder(nn.Module):
     def __init__(self,
-                 device,
-                 param_out='none',
-                 hidden_size=128,
-                 future_steps=30,
-                 num_modes=6) -> None:
+                    device,
+                    param_out='none',
+                    hidden_size=128,
+                    future_steps=30,
+                    num_modes=6) -> None:
+        """
+        SceneDecoder类的初始化方法。
+
+        参数:
+        - device: 用于指定运行设备（如CPU或GPU）。
+        - param_out: 指定输出参数的类型，默认为'none'。
+        - hidden_size: 隐藏层的大小，默认为128。
+        - future_steps: 预测的未来步数，默认为30。
+        - num_modes: 模式数量，默认为6。
+
+        返回:
+        无返回值。
+        """
         super(SceneDecoder, self).__init__()
         self.hidden_size = hidden_size
         self.future_steps = future_steps
@@ -354,37 +412,40 @@ class SceneDecoder(nn.Module):
         self.device = device
         self.param_out = param_out
 
+        # 计算演员（actor）和上下文（ctx）投影层的维度，并初始化投影层
         dim_mm = self.hidden_size * num_modes
         dim_inter = dim_mm // 2
         self.actor_proj = nn.Sequential(
-            nn.Linear(self.hidden_size, dim_inter),
-            nn.LayerNorm(dim_inter),
-            nn.ReLU(inplace=True),
-            nn.Linear(dim_inter, dim_mm),
-            nn.LayerNorm(dim_mm),
-            nn.ReLU(inplace=True)
+            nn.Linear(self.hidden_size, dim_inter), # 第一层线性变换
+            nn.LayerNorm(dim_inter),    # 层归一化
+            nn.ReLU(inplace=True),  # ReLU激活函数
+            nn.Linear(dim_inter, dim_mm),   # 第二层线性变换
+            nn.LayerNorm(dim_mm),   # 层归一化
+            nn.ReLU(inplace=True)   # ReLU激活函数
         )
 
+        # context projection，表示上下文投影层
         self.ctx_proj = nn.Sequential(
-            nn.Linear(self.hidden_size, dim_inter),
-            nn.LayerNorm(dim_inter),
-            nn.ReLU(inplace=True),
-            nn.Linear(dim_inter, dim_mm),
-            nn.LayerNorm(dim_mm),
-            nn.ReLU(inplace=True)
+            nn.Linear(self.hidden_size, dim_inter), # 第一层线性变换
+            nn.LayerNorm(dim_inter),    # 层归一化
+            nn.ReLU(inplace=True),  # ReLU激活函数
+            nn.Linear(dim_inter, dim_mm),   # 第二层线性变换
+            nn.LayerNorm(dim_mm),   # 层归一化
+            nn.ReLU(inplace=True)   # ReLU激活函数
         )
 
         # several layers of transformer encoder
         enc_layer = TransformerEncoderLayer(d_model=self.hidden_size, nhead=4, dim_feedforward=self.hidden_size * 12)
-        self.ctx_sat = TransformerEncoder(enc_layer, num_layers=2)
+        self.ctx_sat = TransformerEncoder(enc_layer, num_layers=2)  # context saturation上下文饱和层，增强上下文信息的表示能力
 
         # linear projection for rpe embedding rpe_dim = 11
         self.proj_rpe = nn.Sequential(
-            nn.Linear(5 * 2 * 2, self.hidden_size),
-            nn.LayerNorm(self.hidden_size),
-            nn.ReLU(inplace=True)
+            nn.Linear(5 * 2 * 2, self.hidden_size), # 输入维度为20，输出维度为hidden_size
+            nn.LayerNorm(self.hidden_size), # 层归一化
+            nn.ReLU(inplace=True)   # ReLU激活函数
         )
 
+        # 初始化目标投影层
         self.proj_tgt = nn.Sequential(
             nn.Linear(2 * self.hidden_size, self.hidden_size),
             nn.LayerNorm(self.hidden_size),
@@ -394,6 +455,7 @@ class SceneDecoder(nn.Module):
             nn.ReLU(inplace=True)
         )
 
+        # 初始化分类器
         self.cls = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.LayerNorm(self.hidden_size),
@@ -404,11 +466,11 @@ class SceneDecoder(nn.Module):
             nn.Linear(self.hidden_size, 1)
         )
 
+        # 根据param_out参数初始化回归器
         if self.param_out == 'bezier':
             self.N_ORDER = 7
             self.mat_T = self._get_T_matrix_bezier(n_order=self.N_ORDER, n_step=future_steps).to(self.device)
             self.mat_Tp = self._get_Tp_matrix_bezier(n_order=self.N_ORDER, n_step=future_steps).to(self.device)
-
             self.reg = nn.Sequential(
                 nn.Linear(self.hidden_size, self.hidden_size),
                 nn.LayerNorm(self.hidden_size),
@@ -422,7 +484,6 @@ class SceneDecoder(nn.Module):
             self.N_ORDER = 7
             self.mat_T = self._get_T_matrix_monomial(n_order=self.N_ORDER, n_step=future_steps).to(self.device)
             self.mat_Tp = self._get_Tp_matrix_monomial(n_order=self.N_ORDER, n_step=future_steps).to(self.device)
-
             self.reg = nn.Sequential(
                 nn.Linear(self.hidden_size, self.hidden_size),
                 nn.LayerNorm(self.hidden_size),
@@ -480,44 +541,78 @@ class SceneDecoder(nn.Module):
         return torch.Tensor(np.array(Tp).T)
 
     def forward(self,
-                ctx: torch.Tensor,
-                actors: torch.Tensor,
-                actor_idcs: List[Tensor],
-                tgt_feat: torch.Tensor,
-                tgt_rpes: torch.Tensor):
-        res_cls, res_reg, res_aux = [], [], []
+                ctx: torch.Tensor,  # 交通上下文特征
+                actors: torch.Tensor,   # agent特征
+                actor_idcs: List[Tensor],   # agent索引列表
+                tgt_feat: torch.Tensor, # 目标特征
+                tgt_rpes: torch.Tensor):    # 目标相对于位置的嵌入
+        """
+        模型的前向传播函数。
 
+        参数:
+        - ctx: 交通上下文特征，类型为torch.Tensor
+        - actors: agent特征，类型为torch.Tensor
+        - actor_idcs: agent索引列表，类型为List[Tensor]
+        - tgt_feat: 目标特征，类型为torch.Tensor
+        - tgt_rpes: 目标相对于位置的嵌入，类型为torch.Tensor
+
+        返回值:
+        - res_cls: 分类结果列表
+        - res_reg: 回归结果列表
+        - res_aux: 辅助结果列表
+        """
+        res_cls, res_reg, res_aux = [], [], []
+        # 对目标相对于位置的嵌入进行投影:high-level commands的target node
         tgt_rpes = self.proj_rpe(tgt_rpes)  # [n_av, 128]
+        # 如果目标特征维度为1，增加一个维度
         if len(tgt_feat.shape) == 1:
             tgt_feat = tgt_feat.unsqueeze(0)
 
+        # 对目标特征和相对位置嵌入的组合进行投影
         tgt = self.proj_tgt(torch.cat([tgt_feat, tgt_rpes], dim=-1))
 
+        # 遍历每个agent索引，进行特征嵌入和预测
         for idx, a_idcs in enumerate(actor_idcs):
-            _ctx = ctx[idx].unsqueeze(0)
-            _actors = actors[a_idcs]
+            _ctx = ctx[idx].unsqueeze(0)    # 获取当前交通上下文并调整维度
+            _actors = actors[a_idcs]    # 获取当前agent特征
 
+            # 对交通上下文进行投影并调整维度，然后进行饱和处理
             cls_embed = self.ctx_proj(_ctx).view(-1, self.num_modes, self.hidden_size).permute(1, 0, 2)
             cls_embed = self.ctx_sat(cls_embed)
 
+            # 对agent特征进行投影并调整维度
             actor_embed = self.actor_proj(_actors).view(-1, self.num_modes, self.hidden_size).permute(1, 0, 2)
 
+            # 初始化目标嵌入，并将第一个目标嵌入设置为投影后的目标特征
+            # 猜测：high-level commands的target node
             tgt_embed = torch.zeros_like(actor_embed)
-
             tgt_embed[0] = tgt[idx].unsqueeze(0)
 
+            # 结合交通上下文、agent和目标嵌入，进行分类和回归预测
             embed = cls_embed + actor_embed + tgt_embed
-
             cls = self.cls(cls_embed).view(self.num_modes, -1)
 
+            # 根据不同的输出参数，计算回归参数、速度和协方差
             if self.param_out == 'bezier':
+                # 通过 self.reg 层处理 embed 向量，然后将其重塑为形状 (num_modes, -1, N_ORDER + 1, 5) 的张量
+                # param 包含了不同模式下的贝塞尔曲线参数，每个模式有 N_ORDER + 1 个控制点，每个控制点有 5 个参数
                 param = self.reg(embed).view(self.num_modes, -1, self.N_ORDER + 1, 5)
+
+                # 作用：提取 param 中前两个维度的数据，即位置参数，并重新排列维度顺序。
+                # 物理意义：reg_param 包含了位置参数，每个控制点有 2 个位置坐标。
                 reg_param = param[..., :2]
                 reg_param = reg_param.permute(1, 0, 2, 3)
-                reg = torch.matmul(self.mat_T, reg_param)
-                vel = torch.matmul(self.mat_Tp, torch.diff(reg_param, dim=2)) / (self.future_steps * 0.1)
+
+                # reg 可以被看作是未来位置的一个预测或表示
+                reg = torch.matmul(self.mat_T, reg_param)   # 矩阵乘法 torch.matmu
+                vel = torch.matmul(self.mat_Tp, torch.diff(reg_param, dim=2)) / (self.future_steps * 0.1)   # 通过矩阵乘法 torch.matmul 和差分 torch.diff 计算速度 vel
+
+                # 作用：提取 param 中从第三个维度开始的数据，即协方差参数，并重新排列维度顺序。
+                # 物理意义：cov_param 包含了协方差参数，每个控制点有 3 个协方差参数
                 cov_param = param[..., 2:]
                 cov_param = cov_param.permute(1, 0, 2, 3)
+
+                # 计算 协方差cov 和 协方差速度cov_vel
                 cov = torch.matmul(self.mat_T, cov_param)
                 cov_vel = torch.matmul(self.mat_Tp, torch.diff(cov_param, dim=2)) / (self.future_steps * 0.1)
 
@@ -541,6 +636,7 @@ class SceneDecoder(nn.Module):
                 cov = cov.permute(1, 0, 2, 3)
                 cov_vel = torch.gradient(cov, dim=-2)[0] / 0.1
 
+            # 将回归结果和辅助信息组合并存储
             reg = torch.cat([reg, torch.exp(cov)], dim=-1)
 
             cls = cls.permute(1, 0)
@@ -552,26 +648,33 @@ class SceneDecoder(nn.Module):
             else:
                 res_aux.append((vel, cov_vel, param))
 
+        # res_cls：表示对于每个模式（mode）的分类概率。具体来说，它包含了模型对不同未来轨迹模式的概率分布估计。这些概率可以用来评估不同预测路径的可能性大小，帮助决策系统选择最有可能的未来轨迹
+        # res_reg：表示对于每个预测模式的具体轨迹参数。这些参数描述了预测轨迹的具体形状或位置信息，例如位置坐标、速度等。根据不同的 param_out 设置，回归结果可能包含贝塞尔曲线参数、多项式系数或其他形式的轨迹描述
+        # res_aux：提供了额外的信息来辅助理解或评估回归结果。具体来说，它包含了预测轨迹的速度（vel）、协方差（cov_vel）以及在某些情况下还包含了原始的回归参数（param）
         return res_cls, res_reg, res_aux
 
 
 class ScenePredNet(nn.Module):
     # Initialization
     def __init__(self, cfg, device):
-        super(ScenePredNet, self).__init__()
+        super(ScenePredNet, self).__init__()    # 调用父类的初始化方法
         self.device = device
 
+        # 初始化演员网络，用于处理演员相关的数据和行为
         self.actor_net = ActorNet(n_in=cfg['in_actor'],
                                   hidden_size=cfg['d_actor'],
                                   n_fpn_scale=cfg['n_fpn_scale'])
 
+        # 初始化车道网络，用于处理车道相关的数据和行为
         self.lane_net = LaneNet(device=self.device,
                                 in_size=cfg['in_lane'],
                                 hidden_size=cfg['d_lane'],
                                 dropout=cfg['dropout'])
 
+        # 初始化融合网络，用于融合演员网络和车道网络的信息
         self.fusion_net = FusionNet(device=self.device, config=cfg)
 
+        # 初始化场景解码器，用于根据融合的信息预测未来的场景
         self.pred_scene = SceneDecoder(device=self.device,
                                        param_out=cfg['param_out'],
                                        hidden_size=cfg['d_embed'],
@@ -579,12 +682,30 @@ class ScenePredNet(nn.Module):
                                        num_modes=cfg['g_num_modes'])
 
     def forward(self, data):
+        """
+        前向传播函数，用于处理输入数据并生成预测结果。
+
+        参数:
+        - data: 包含多个数据部分的元组，具体包括：
+            - actors: 表示演员节点的特征
+            - actor_idcs: 演员节点的索引
+            - lanes: 表示车道节点的特征
+            - lane_idcs: 车道节点的索引
+            - rpe: relative positional embedding，相对位置误差，用于演员和车道之间的关联
+            - tgt_nodes: 目标节点的特征
+            - tgt_rpe: 目标节点的相对位置误差
+
+        返回:
+        - out: 预测的场景图模型输出
+        """
+
+        # 解包输入数据
         actors, actor_idcs, lanes, lane_idcs, rpe, tgt_nodes, tgt_rpe = data
 
         # * actors/lanes encoding
         actors = self.actor_net(actors)  # output: [N_{actor}, 128]
         lanes = self.lane_net(lanes)  # output: [N_{lane}, 128]
-        # tgt encode
+        # tgt encode, 这东西是high-level commands的出来的Target node
         tgt_feat = self.lane_net(tgt_nodes)  # output: [1, 128]
         # * fusion
         actors, lanes, cls = self.fusion_net(actors, actor_idcs, lanes, lane_idcs, rpe)
@@ -598,7 +719,7 @@ class ScenePredNet(nn.Module):
         actor_idcs = gpu(data['ACTOR_IDCS'], self.device)
         lanes = gpu(data['LANES'], self.device)
         lane_idcs = gpu(data['LANE_IDCS'], self.device)
-        rpe = gpu(data['RPE'], self.device)
+        rpe = gpu(data['RPE'], self.device) # rpe: relative positional embedding
         tgt_nodes = gpu(data['TGT_NODES'], self.device)
         tgt_rpe = gpu(data['TGT_RPE'], self.device)
 
