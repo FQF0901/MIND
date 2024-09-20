@@ -10,6 +10,7 @@ from planners.mind.networks.layers import Conv1d, Res1d
 
 
 # ActorNet 是一个多尺度的卷积神经网络（借鉴了FPN），通过特征金字塔结构提取不同层次的特征，结合了残差连接和上采样机制，适用于处理时序数据或一维信号特征提取
+# 用来建模这些交通参与者的动态行为, 识别其他交通参与者的动作和意图，预测它们在未来几秒内的可能移动路径
 class ActorNet(nn.Module):
     """
     Actor feature extractor with Conv1D
@@ -46,6 +47,8 @@ class ActorNet(nn.Module):
         self.output = Res1d(hidden_size, hidden_size, norm=norm, ng=ng)
 
     '''
+    ActorNet
+
     Input: (batch_size, 3, seq_len)
 
     +------------------------+      +---------------------------+      +---------------------------+       +---------------------------+
@@ -152,8 +155,10 @@ class ActorNet(nn.Module):
         out = self.output(out)[:, :, -1]
         return out
 
-
-# PointAggregateBlock 是一个特征聚合模块，利用全连接层和最大池化操作来处理输入特征，并提供灵活的输出选择。这个结构适合用于处理图像或时间序列数据中的局部特征聚合
+# 在自动驾驶任务中，特别是涉及车道检测和轨迹预测时，每个车道上的特征点（如车道线上的点）包含了丰富的信息。
+# 这些特征点的分布和动态变化对于理解车道的状态和预测未来的行为非常重要。
+# 然而，单纯依赖每个特征点的局部信息可能不足以捕捉全局的车道特征，因此需要一种方法来聚合这些局部特征，提取出更高级的全局信息
+# PointAggregateBlock 的设计目的是通过对车道上所有特征点的特征进行聚合，利用全连接层和最大池化操作提取出车道的全局特征。
 class PointAggregateBlock(nn.Module):
     def __init__(self, hidden_size: int, aggre_out: bool, dropout: float = 0.1) -> None:
         super(PointAggregateBlock, self).__init__()
@@ -177,21 +182,61 @@ class PointAggregateBlock(nn.Module):
         )
         self.norm = nn.LayerNorm(hidden_size)
 
+    # 通过全局最大池化（Global Max Pooling）将每个车道的所有特征点聚合为一个全局特征向量：得到每个车道的一个全局特征向量
     def _global_maxpool_aggre(self, feat):
         return F.adaptive_max_pool1d(feat.permute(0, 2, 1), 1).permute(0, 2, 1)
 
     def forward(self, x_inp):
+        # 1. fc1层目的是对输入特征进行非线性变换，提取出更高级的特征表示
         x = self.fc1(x_inp)  # [N_{lane}, 10, hidden_size]
+
+        # 2. 将原始特征和全局特征向量拼接在一起，形成新的特征表示。这样可以保留局部特征的同时，加入全局特征的信息
         x_aggre = self._global_maxpool_aggre(x)
         x_aggre = torch.cat([x, x_aggre.repeat([1, x.shape[1], 1])], dim=-1)
 
+        # 3. fc2层的目的是将局部特征和全局特征有效融合，生成更鲁棒的特征表示
         out = self.norm(x_inp + self.fc2(x_aggre))
         if self.aggre_out:
             return self._global_maxpool_aggre(out).squeeze()
         else:
             return out
 
+'''
+LaneNet
 
++-------------------+
+| Input: [N_lane, 10, in_size] |
++-------------------+
+              |
+              v
++-------------------+
+| proj (Linear, LN, ReLU) |
+| [N_lane, 10, in_size] -> [N_lane, 10, hidden_size] |
++-------------------+
+              |
+              v
++-------------------+
+| aggre1 (PointAggregateBlock) |
+| [N_lane, 10, hidden_size] -> [N_lane, 10, hidden_size] |
++-------------------+
+              |
+              v
++-------------------+
+| aggre2 (PointAggregateBlock) |
+| [N_lane, 10, hidden_size] -> [N_lane, hidden_size] |
++-------------------+
+              |
+              v
++-------------------+
+| Output: [N_lane, hidden_size] |
++-------------------+
+
+
+输入层：[N_{lane}, 10, in_size], N_{lane} 是车道的数量，10 是每个车道的采样点数，in_size 是每个采样点的特征维度
+投影层：proj 将输入特征映射到 hidden_size 维度，输出形状为 [N_{lane}, 10, hidden_size]。
+第一聚合块：aggre1 进行特征聚合和变换，输出形状为 [N_{lane}, 10, hidden_size]。
+第二聚合块：aggre2 再次进行特征聚合和变换，并最终输出形状为 [N_{lane}, hidden_size]。
+'''
 class LaneNet(nn.Module):
     def __init__(self, device, in_size=10, hidden_size=128, dropout=0.1):
         super(LaneNet, self).__init__()
@@ -213,7 +258,62 @@ class LaneNet(nn.Module):
         x = self.aggre2(x)  # [N_{lane}, hidden_size]
         return x
 
+'''
+RelaFusionLayer
 
++-------------------+
+| Input:            |
+| node: [N, d_model]|
+| edge: [N, N, d_edge]|
+| edge_mask: [N, N] |
++-------------------+
+              |
+              v
++-------------------+
+| forward           |
+| 1. x, edge, memory = _build_memory(node, edge) |
+| 2. x_prime, _ = _mha_block(x, memory, attn_mask=None, key_padding_mask=edge_mask) |
+| 3. x = norm2(x + x_prime).squeeze()  # [N, d_model] |
+| 4. x = norm3(x + _ff_block(x))  # [N, d_model] |
+| 5. return x, edge, None |
++-------------------+
+              |
+              v
++-------------------+
+| _build_memory     |
+| 1. src_x: [N, N, d_model]|
+| 2. tar_x: [N, N, d_model]|
+| 3. memory: [N, N, d_model]|
+| 4. if update_edge:|
+|    edge: [N, N, d_edge]  |
+| 5. return [1, N, d_model], [N, N, d_edge], [N, N, d_model] |
++-------------------+
+              |
+              v
++-------------------+
+| _mha_block        |
+| 1. x: [1, N, d_model]|
+| 2. return [1, N, d_model], None |
++-------------------+
+              |
+              v
++-------------------+
+| _ff_block         |
+| 1. x: [N, d_model]|
+| 2. return [N, d_model] |
++-------------------+
+              |
+              v
++-------------------+
+| Output:           |
+| x: [N, d_model]   |
+| edge: [N, N, d_edge]|
+| None              |
++-------------------+
+'''
+# RelaFusionLayer)(Relation Fusion Layer) 是一个用于处理图结构数据（如交通网络中的节点和边）的神经网络层。
+# 它的主要功能是在图结构中融合节点和边的信息，通过多头注意力机制和前馈网络来更新节点特征，并可选地更新边特征。
+# 这种设计特别适用于需要理解节点之间的关系和动态变化的任务，如自动驾驶中的交通参与者轨迹预测和行为识别
 class RelaFusionLayer(nn.Module):
     def __init__(self,
                  device,
@@ -297,6 +397,53 @@ class RelaFusionLayer(nn.Module):
         return node.unsqueeze(dim=0), edge, memory
 
     # multihead attention block
+    '''
+    multihead attention block
+
+    [Input x] ---> [Multihead Attention] ---> [Dropout] ---> [Output x]
+                    ↑
+               [Memory mem]
+
+    +-------------------+
+    | Input:            |
+    | x: [1, N, d_model]|
+    | mem: [N, N, d_model]|
+    | attn_mask: [N, N] (optional)|
+    | key_padding_mask: [N, N] (optional)|
+    +-------------------+
+                |
+                v
+    +-------------------+
+    | Multi-Head Attention |
+    | query: x [1, N, d_model] |
+    | key: mem [N, N, d_model] |
+    | value: mem [N, N, d_model] |
+    | attn_mask: [N, N] (optional)|
+    | key_padding_mask: [N, N] (optional)|
+    | need_weights: False |
+    | 1. Compute attention scores |
+    | 2. Apply attention mask |
+    | 3. Apply key padding mask |
+    | 4. Compute weighted sum |
+    | 5. Output x [1, N, d_model] |
+    | 6. Output attention_weights [1, N, N] (not returned) |
+    +-------------------+
+                |
+                v
+    +-------------------+
+    | Dropout Layer     |
+    | input: x [1, N, d_model]|
+    | 1. Randomly drop neurons |
+    | 2. Output x [1, N, d_model]|
+    +-------------------+
+                |
+                v
+    +-------------------+
+    | Output:           |
+    | x: [1, N, d_model]|
+    | None              |
+    +-------------------+
+    '''
     def _mha_block(self,
                    x: Tensor,
                    mem: Tensor,
