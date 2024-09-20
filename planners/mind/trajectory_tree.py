@@ -20,15 +20,15 @@ class TrajectoryTreeOptimizer:
         x0 = self._get_init_state(init_state, init_ctrl)
         res = self.config.w_opt_cfg['smooth_grid_res']
         grid_size = self.config.w_opt_cfg['smooth_grid_size']
-        offsets, xx, yy, dist_field = gen_dist_field(x0, target_lane, grid_size, res)
-        quad_dist_field = dist_field ** 2
+        offsets, xx, yy, dist_field = gen_dist_field(x0, target_lane, grid_size, res)   # 计算与目标车道的距离场，为路径选择提供基础，反映出环境对车辆路径的影响
+        quad_dist_field = dist_field ** 2   # 平方距离场有助于强调离目标更远的区域，影响成本计算
 
-        cost_tree = Tree()
+        cost_tree = Tree()  # 创建根节点，初始化成本树的结构，便于后续的节点添加和管理
         cost_tree.add_node(Node(-1, None, x0))
         # DFS to convert scenario tree to trajectory tree maintain the last traj node index of each scenario node
         last_traj_node_index = {}
         queue = [scen_tree.get_root()]
-        while queue:
+        while queue:    # 深度优先遍历场景树，将每个场景的轨迹信息转化为成本树的节点，构建新的结构
             cur_node = queue.pop()
             # [prob] [ego + exo, N, state_dim] [ego + exo, N, state_dim, state_dim]
             prob, trajs, covs, tgt_pts = cur_node.data
@@ -38,8 +38,10 @@ class TrajectoryTreeOptimizer:
                 if i % 2 == 1:
                     continue
                 cur_index = len(cost_tree.nodes) - 1
-                quad_cost_field = self.config.w_opt_cfg['w_tgt'] * prob * quad_dist_field
+                quad_cost_field = self.config.w_opt_cfg['w_tgt'] * prob * quad_dist_field   # 根据概率和二次距离场计算成本，反映出不同路径的可行性和优先级
                 pot_field = PotentialField(offsets, res, xx, yy, quad_cost_field)
+
+                # 考虑车辆动态和约束，影响优化的最终路径选择
                 state_pot = StatePotential(self.config.w_opt_cfg['w_des_state'] * prob,
                                            np.array([0, 0, target_vel, 0.0, 0.0, 0.0]))
                 state_con = StateConstraint(self.config.w_opt_cfg['w_state_con'] * prob,

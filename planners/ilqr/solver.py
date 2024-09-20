@@ -96,63 +96,76 @@ class iLQR:
         self.cost = cost
         N = len(us_init)
         self.N = N
+
+        # _k和_K是用于存储控制增益的数组，分别对应于每个时间步的增益
         self._k = np.zeros((N, self.dynamics.action_size))
         self._K = np.zeros((N, self.dynamics.action_size, self.dynamics.state_size))
 
+        # xs和us用于存储状态和控制路径，初始为空数组
         self.xs = np.empty((N, self.dynamics.state_size))
         self.us = np.empty((N, self.dynamics.action_size))
+
+        # F_x和F_u存储状态和控制对状态变化的影响
         self.F_x = np.empty((N, self.dynamics.state_size, self.dynamics.state_size))
         self.F_u = np.empty((N, self.dynamics.state_size, self.dynamics.action_size))
 
+        # 如果启用海森矩阵，初始化相应的多维数组，以计算二阶导数
         if self._use_hessians:
             self.F_xx = np.empty((N, self.dynamics.state_size, self.dynamics.state_size, self.dynamics.state_size))
             self.F_ux = np.empty((N, self.dynamics.state_size, self.dynamics.action_size, self.dynamics.state_size))
             self.F_uu = np.empty((N, self.dynamics.state_size, self.dynamics.action_size, self.dynamics.action_size))
-
+        
+        # 初始化存储每个时间步成本及其对状态和控制的导数（包括一阶和二阶导数）
         self.L = np.empty(N)
         self.L_x = np.empty((N, self.dynamics.state_size))
         self.L_u = np.empty((N, self.dynamics.action_size))
         self.L_xx = np.empty((N, self.dynamics.state_size, self.dynamics.state_size))
         self.L_ux = np.empty((N, self.dynamics.action_size, self.dynamics.state_size))
         self.L_uu = np.empty((N, self.dynamics.action_size, self.dynamics.action_size))
+
+        # dV存储价值函数的变化，V_x和V_xx分别存储一阶和二阶导数
         self.dV = np.empty(N)
         self.V_x = np.empty((N, self.dynamics.state_size))
         self.V_xx = np.empty((N, self.dynamics.state_size, self.dynamics.state_size))
 
-        # Reset regularization term.
+        # Reset regularization term. 初始化正则化参数_mu和_delta，用于稳定优化过程
         self._mu = 1.0
         self._delta = self._delta_0
 
-        # Backtracking line search candidates 0 < alpha <= 1.
+        # Backtracking line search candidates 0 < alpha <= 1. 定义候选步长alphas，用于后续的回溯线搜索，以确保控制更新的有效性
         alphas = 1.1 ** (-np.arange(10) ** 2)
 
+        # 将初始控制路径复制到self.us，并将增益数组赋值给self.k和self.K
         self.us = us_init.copy()
         self.k = self._k
         self.K = self._K
 
+        # accepted标记当前更新是否被接受，converged标记是否收敛
         accepted = True
         converged = False
+
+        # 开始循环，直到达到最大迭代次数
         for iteration in range(n_iterations):
-            # Forward rollout only if it needs to be recomputed.
+            # Forward rollout only if it needs to be recomputed. 如果当前更新被接受，执行前向传播以计算状态路径，并将accepted设置为False，以避免重复计算
             if accepted:
                 self._forward_rollout()
                 accepted = False
             try:
-                # Backward pass.
+                # Backward pass. 尝试进行后向传播，以计算梯度和更新控制
                 self._backward_pass()
 
                 # Backtracking line search.
-                accepted, converged = self._backtrack_line_search(alphas)
+                accepted, converged = self._backtrack_line_search(alphas)   # 执行回溯线搜索，根据步长调整更新并检查是否接受。
                 if converged:
-                    break
+                    break   # 如果算法收敛，退出迭代循环
 
-            except np.linalg.LinAlgError as e:
+            except np.linalg.LinAlgError as e:  # 捕获线性代数错误，通常与矩阵不正定相关
                 # Quu was not positive-definite and this diverged.
                 # Try again with a higher regularization term.
                 warnings.warn(str(e))
 
             if not accepted:
-                # Increase regularization term.
+                # Increase regularization term. 如果未接受更新，增加正则化参数，以便稳定计算。如果超过最大正则化值，则发出警告并退出
                 warnings.warn("increasing regularization term")
                 self._delta = max(1.0, self._delta) * self._delta_0
                 self._mu = max(self._mu_min, self._mu * self._delta)
@@ -161,7 +174,7 @@ class iLQR:
                     break
 
 
-        # Store fit parameters.
+        # Store fit parameters. 保存最终的控制增益和路径
         self._k = self.k
         self._K = self.K
         self._nominal_xs = self.xs
