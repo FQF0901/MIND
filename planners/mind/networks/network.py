@@ -9,21 +9,22 @@ from planners.mind.utils import gpu
 from planners.mind.networks.layers import Conv1d, Res1d
 
 
+# ActorNet 是一个多尺度的卷积神经网络，通过特征金字塔结构提取不同层次的特征，结合了残差连接和上采样机制，适用于处理时序数据或一维信号特征提取
 class ActorNet(nn.Module):
     """
     Actor feature extractor with Conv1D
     """
 
-    def __init__(self, n_in=3, hidden_size=128, n_fpn_scale=4):
+    def __init__(self, n_in=3, hidden_size=128, n_fpn_scale=4): # n_in 是输入通道数，FPN隐藏层大小，FPN的尺度数
         super(ActorNet, self).__init__()
-        norm = "GN"
+        norm = "GN" # 归一化方法，这里是“GN”（Group Normalization）
         ng = 1
 
         n_out = [2 ** (5 + s) for s in range(n_fpn_scale)]  # [32, 64, 128]
         blocks = [Res1d] * n_fpn_scale
         num_blocks = [2] * n_fpn_scale
 
-        groups = []
+        groups = [] # 每个 group 包含多个 Res1d 块，每个 Res1d 块的输出通道数为 n_out[i]，步长为1或2（取决于是否是第一个块）
         for i in range(len(num_blocks)):
             group = []
             if i == 0:
@@ -44,6 +45,62 @@ class ActorNet(nn.Module):
 
         self.output = Res1d(hidden_size, hidden_size, norm=norm, ng=ng)
 
+    # 前向传播
+    # 1. 通过 groups
+    # out 经过每个 group 后，保存到 outputs 列表中。
+    # outputs 列表包含4个元素，每个元素的形状分别为：
+    # (batch_size, 32, seq_len)
+    # (batch_size, 64, seq_len // 2)
+    # (batch_size, 128, seq_len // 4)
+    # (batch_size, 256, seq_len // 8)
+    # 2. 通过 lateral
+    # out = self.lateral[-1](outputs[-1])：(batch_size, 128, seq_len // 8)
+    # 对 out 进行上采样，然后加上 lateral 处理后的 outputs：
+    # out = F.interpolate(out, scale_factor=2, mode="linear", align_corners=False)：(batch_size, 128, seq_len // 4)
+    # out += self.lateral[2](outputs[2])：(batch_size, 128, seq_len // 4)
+    # out = F.interpolate(out, scale_factor=2, mode="linear", align_corners=False)：(batch_size, 128, seq_len // 2)
+    # out += self.lateral[1](outputs[1])：(batch_size, 128, seq_len // 2)
+    # out = F.interpolate(out, scale_factor=2, mode="linear", align_corners=False)：(batch_size, 128, seq_len)
+    # out += self.lateral[0](outputs[0])：(batch_size, 128, seq_len)
+    # 3. 最终输出
+    # out = self.output(out)[:, :, -1]：(batch_size, 128, 1)
+
+    '''
+    Input: (batch_size, 3, seq_len)
+
+    +------------------------+      +---------------------------+      +---------------------------+       +---------------------------+
+    | Group 1                |      | Group 2                   |      | Group 3                   |       | Group 4                   |
+    |                        |      |                           |      |                           |       |                           |
+    | Res1d(3, 32)           |      | Res1d(32, 64, 2)          |      | Res1d(64, 128, 2)         |       | Res1d(128, 256, 2)        |
+    | Res1d(32, 32)          |      | Res1d(64, 64)             |      | Res1d(128, 128)           |       | Res1d(256, 256)           |
+    +------------------------+      +---------------------------+      +---------------------------+       +---------------------------+
+    | Output: (32, seq_len)  |      | Output: (64, seq_len//2)  |      | Output: (128, seq_len//4) |       | Output: (256, seq_len//8) |
+
+    +------------------------+      +---------------------------+      +---------------------------+       +---------------------------+
+    | Lateral 1              |      | Lateral 2                 |      | Lateral 3                 |       | Lateral 4                 |
+    | Conv1d(32, 128)        |      | Conv1d(64, 128)           |      | Conv1d(128, 128)          |       | Conv1d(256, 128)          |
+    +------------------------+      +---------------------------+      +---------------------------+       +---------------------------+
+    | Output: (128, seq_len) |      | Output: (128, seq_len//2) |      | Output: (128, seq_len//4) |       | Output: (128, seq_len//8) |
+
+    +------------------------+
+    | Interpolate and Add    |
+    |                        |
+    | Interpolate x2         |
+    | Add Lateral 3          |
+    | Interpolate x2         |
+    | Add Lateral 2          |
+    | Interpolate x2         |
+    | Add Lateral 1          |
+    +------------------------+
+    | Output: (128, seq_len) |
+
+    +---------------------+
+    | Final Output        |
+    |                     |
+    | Res1d(128, 128)     |
+    | Output: (128, 1)    |
+    +---------------------+
+    '''
     def forward(self, actors: Tensor) -> Tensor:
         out = actors
 
@@ -61,6 +118,7 @@ class ActorNet(nn.Module):
         return out
 
 
+# PointAggregateBlock 是一个特征聚合模块，利用全连接层和最大池化操作来处理输入特征，并提供灵活的输出选择。这个结构适合用于处理图像或时间序列数据中的局部特征聚合
 class PointAggregateBlock(nn.Module):
     def __init__(self, hidden_size: int, aggre_out: bool, dropout: float = 0.1) -> None:
         super(PointAggregateBlock, self).__init__()
