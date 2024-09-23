@@ -511,7 +511,7 @@ class RelaFusionLayer(nn.Module):
     def _ff_block(self,
                   x: Tensor) -> Tensor:
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        return self.dropout3(x)
+        return self.dropout3(x) # 这个x包含actor、lane、context3类信息
 
 
 class RelaFusionNet(nn.Module):
@@ -548,7 +548,7 @@ class RelaFusionNet(nn.Module):
         # attn_multilayer = []
         for mod in self.fusion:
             x, edge, _ = mod(x, edge, edge_mask)
-        return x, None
+        return x, None  # 这个x包含actor、lane、context3类信息
 
 
 class FusionNet(nn.Module):
@@ -657,18 +657,130 @@ class FusionNet(nn.Module):
             out, _ = self.fuse_scene(tokens_with_cls, rpe_with_cls, edge_mask=None) # 实际对应RelaFusionLayer中forward的node、edge、edge_mask
 
             # 将处理结果分别添加到对应的列表中
-            actors_new.append(out[:len(a_idcs)])
-            lanes_new.append(out[len(a_idcs):-1])
-            cls_new.append(out[-1].unsqueeze(0))
+            actors_new.append(out[:len(a_idcs)])    # actors_new: 包含了更新后的代理（例如车辆、行人等）的状态。这部分是从输出的开始到a_idcs长度的部分
+            lanes_new.append(out[len(a_idcs):-1])   # lanes_new: 包含了更新后的车道状态。这部分是从a_idcs长度的位置到倒数第二个元素
+            cls_new.append(out[-1].unsqueeze(0))    # cls_new: 包含了分类标记（cls）的信息。这部分是输出的最后一个元素，并且通过unsqueeze(0)操作增加了一个维度，使其形状变为(1, hidden_size)
 
         # 将所有样本的数据合并
         actors = torch.cat(actors_new, dim=0)
         lanes = torch.cat(lanes_new, dim=0)
-        cls = torch.cat(cls_new, dim=0)
+        cls = torch.cat(cls_new, dim=0) # cls会被用作SceneDecoder中forward里的context
 
         return actors, lanes, cls
 
 
+'''
+SceneDecoder
+
++-------------------+
+|    输入           |
+|                   |
+|  ctx: (batch_size, hidden_size)  |
+|  actors: (num_actors, hidden_size)  |
+|  actor_idcs: List[Tensor]  |
+|  tgt_feat: (batch_size, hidden_size)  |
+|  tgt_rpes: (batch_size, 20)  |
++-------------------+
+          |
+          v
++-------------------+
+| RPE 嵌入投影       |
+| self.proj_rpe     |
+|                   |
+| 输入: (batch_size, 20)  |
+| 输出: (batch_size, hidden_size)  |
++-------------------+
+          |
+          v
++-------------------+
+| 目标特征投影       |
+| self.proj_tgt     |
+|                   |
+| 输入: (batch_size, 2 * hidden_size)  |
+| 输出: (batch_size, hidden_size)  |
++-------------------+
+          |
+          v
++-------------------+
+| 遍历每个 agent     |
+| for idx, a_idcs in enumerate(actor_idcs)  |
+|                   |
+| _ctx: (1, hidden_size)  |
+| _actors: (num_actors, hidden_size)  |
++-------------------+
+          |
+          v
++-------------------+
+| 上下文投影         |
+| self.ctx_proj     |
+|                   |
+| 输入: (1, hidden_size)  |
+| 输出: (num_modes, 1, hidden_size)  |
++-------------------+
+          |
+          v
++-------------------+
+| 上下文饱和         |
+| self.ctx_sat      |
+|                   |
+| 输入: (num_modes, 1, hidden_size)  |
+| 输出: (num_modes, 1, hidden_size)  |
++-------------------+
+          |
+          v
++-------------------+
+| Agent 投影         |
+| self.actor_proj   |
+|                   |
+| 输入: (num_actors, hidden_size)  |
+| 输出: (num_modes, num_actors, hidden_size)  |
++-------------------+
+          |
+          v
++-------------------+
+| 目标嵌入           |
+| tgt_embed         |
+|                   |
+| 形状: (num_modes, num_actors, hidden_size)  |
++-------------------+
+          |
+          v
++-------------------+
+| 特征融合           |
+|                   |
+| 输入: (num_modes, num_actors, hidden_size)  |
+| 输出: (num_modes, num_actors, hidden_size)  |
++-------------------+
+          |
+          v
++-------------------+
+| 分类和回归        |
+|                   |
+| cls_embed: (num_modes, 1, hidden_size)  |
+| actor_embed: (num_modes, num_actors, hidden_size)  |
+| tgt_embed: (num_modes, num_actors, hidden_size)  |
+| embed: (num_modes, num_actors, hidden_size)  |
++-------------------+
+          |
+          +------------------------------------+
+          |                                    |
+          v                                    v
++-------------------+                  +-------------------+
+| 分类               |                  | 回归               |
+| self.cls          |                  | self.reg          |
+|                   |                  |                   |
+| 输入: (num_modes, 1, hidden_size)  |  | 输入: (num_modes, num_actors, hidden_size)  |
+| 输出: (num_modes, 1)  |  | 输出: (num_modes, num_actors, N_ORDER + 1, 5)  |
++-------------------+                  +-------------------+
+          |                                    |
+          v                                    v
++-------------------+                  +-------------------+
+| 结果收集           |                  | 结果收集           |
+|                   |                  |                   |
+| res_cls.append(cls)|  | res_reg.append(reg)|
+| res_aux.append((vel, cov_vel, param))|  | res_aux.append((vel, cov_vel, param))|
++-------------------+                  +-------------------+
+'''
 class SceneDecoder(nn.Module):
     def __init__(self,
                     device,
@@ -996,7 +1108,7 @@ class ScenePredNet(nn.Module):
         # * fusion
         actors, lanes, cls = self.fusion_net(actors, actor_idcs, lanes, lane_idcs, rpe)
         # * decoding
-        out = self.pred_scene(cls, actors, actor_idcs, tgt_feat, tgt_rpe)
+        out = self.pred_scene(cls, actors, actor_idcs, tgt_feat, tgt_rpe)   # cls就是SceneDecoder中forward里的context，是从FusionNet里来的
 
         return out
 
