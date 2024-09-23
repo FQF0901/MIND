@@ -349,13 +349,16 @@ class RelaFusionLayer(nn.Module):
         self.device = device
         self.update_edge = update_edge
 
+        # proj_memory 的目的是构建一个记忆表示，这个记忆表示融合了节点特征和边特征。
+        # 具体来说，proj_memory 将每个节点对之间的边特征和两个节点的特征拼接在一起，然后通过一个线性层投影到 d_model 维度，可以减少特征的维度，使得后续的计算更加高效
         self.proj_memory = nn.Sequential(
-            nn.Linear(d_model + d_model + d_edge, d_model),
+            nn.Linear(d_model + d_model + d_edge, d_model), # 对于每个节点，取其自身的特征（d_model）、邻接节点的特征（d_model），以及与这些边相关的边特征（d_edge）
             nn.LayerNorm(d_model),
             nn.ReLU(inplace=True)
         )
 
         if self.update_edge:
+            # 将 d_model 维度的特征投影回 d_edge 维度
             self.proj_edge = nn.Sequential(
                 nn.Linear(d_model, d_edge),
                 nn.LayerNorm(d_edge),
@@ -383,21 +386,23 @@ class RelaFusionLayer(nn.Module):
                 edge_mask: Optional[Tensor]) -> Tensor:
         '''
             input:
-                node:       (N, d_model)
-                edge:       (N, N, d_model)
-                edge_mask:  (N, N)
+                node:       (N, d_model)，表示 N 个节点的特征向量
+                edge:       (N, N, d_model)，表示 N 个节点之间的边特征，通常是一个邻接矩阵
+                edge_mask:  (N, N)，用于指示边的有效性
         '''
         # update node
-        x, edge, memory = self._build_memory(node, edge)
-        x_prime, _ = self._mha_block(x, memory, attn_mask=None, key_padding_mask=edge_mask)
+        x, edge, memory = self._build_memory(node, edge)    #  更新节点和边的信息
+        x_prime, _ = self._mha_block(x, memory, attn_mask=None, key_padding_mask=edge_mask) # 实现多头注意力机制
         x = self.norm2(x + x_prime).squeeze()
-        x = self.norm3(x + self._ff_block(x))
+        x = self.norm3(x + self._ff_block(x))   # 更新节点特征并返回
         return x, edge, None
 
     def _build_memory(self,
                       node: Tensor,
                       edge: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         '''
+            _build_memory在节点特征和边特征之间建立联系，以便后续的图神经网络操作
+
             input:
                 node:   (N, d_model)
                 edge:   (N, N, d_edge)
@@ -406,16 +411,28 @@ class RelaFusionLayer(nn.Module):
                 :param  (N, N, d_edge)
                 :param  (N, N, d_model)
         '''
-        n_token = node.shape[0]
+        n_token = node.shape[0] # n_token：节点的数量，即 N
 
         # 1. build memory
+        # unsqueeze(dim=0)：在第0维上增加一个维度，形状变为 (1, N, d_model)。
+        # repeat([n_token, 1, 1])：在第0维上重复 n_token 次，形状变为 (N, N, d_model)
         src_x = node.unsqueeze(dim=0).repeat([n_token, 1, 1])  # (N, N, d_model)
+        # unsqueeze(dim=1)：在第1维上增加一个维度，形状变为 (N, 1, d_model)。
+        # repeat([1, n_token, 1])：在第1维上重复 n_token 次，形状变为 (N, N, d_model)。
         tar_x = node.unsqueeze(dim=1).repeat([1, n_token, 1])  # (N, N, d_model)
+        # torch.cat([edge, src_x, tar_x], dim=-1)：将边特征 edge 和扩展后的节点特征 src_x 和 tar_x 拼接在一起，形状变为 (N, N, d_model + d_model + d_edge)
+        # torch.cat：沿着最后一个维度（特征维度）拼接张量
+        # self.proj_memory：通过一个线性层将拼接后的特征投影到 d_model 维度
         memory = self.proj_memory(torch.cat([edge, src_x, tar_x], dim=-1))  # (N, N, d_model)
         # 2. (optional) update edge (with residual)
         if self.update_edge:
+            # self.proj_edge(memory)：通过一个线性层将记忆表示 memory 投影到 d_edge 维度。
+            # edge + self.proj_edge(memory)：将原始边特征 edge 与投影后的记忆表示相加，实现残差连接
             edge = self.norm_edge(edge + self.proj_edge(memory))  # (N, N, d_edge)
 
+        # node.unsqueeze(dim=0)：将节点特征 node 在第0维上增加一个维度，形状变为 (1, N, d_model)
+        # edge：更新后的边特征，形状为 (N, N, d_edge)
+        # memory：记忆表示，形状为 (N, N, d_model)
         return node.unsqueeze(dim=0), edge, memory
 
     # multihead attention block
