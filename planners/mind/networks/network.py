@@ -9,6 +9,99 @@ from planners.mind.utils import gpu
 from planners.mind.networks.layers import Conv1d, Res1d
 
 
+'''
+ActorNet
+
+Input: (batch_size, 3, seq_len)
+
++------------------------+      +---------------------------+      +---------------------------+       +---------------------------+
+| Group 1                |      | Group 2                   |      | Group 3                   |       | Group 4                   |
+|                        |      |                           |      |                           |       |                           |
+| Res1d(3, 32)           |      | Res1d(32, 64, 2)          |      | Res1d(64, 128, 2)         |       | Res1d(128, 256, 2)        |
+| Res1d(32, 32)          |      | Res1d(64, 64)             |      | Res1d(128, 128)           |       | Res1d(256, 256)           |
++------------------------+      +---------------------------+      +---------------------------+       +---------------------------+
+| Output: (32, seq_len)  |      | Output: (64, seq_len//2)  |      | Output: (128, seq_len//4) |       | Output: (256, seq_len//8) |
+
++------------------------+      +---------------------------+      +---------------------------+       +---------------------------+
+| Lateral 1              |      | Lateral 2                 |      | Lateral 3                 |       | Lateral 4                 |
+| Conv1d(32, 128)        |      | Conv1d(64, 128)           |      | Conv1d(128, 128)          |       | Conv1d(256, 128)          |
++------------------------+      +---------------------------+      +---------------------------+       +---------------------------+
+| Output: (128, seq_len) |      | Output: (128, seq_len//2) |      | Output: (128, seq_len//4) |       | Output: (128, seq_len//8) |
+
++------------------------+
+| Interpolate and Add    |
+|                        |
+| Interpolate x2         |
+| Add Lateral 3          |
+| Interpolate x2         |
+| Add Lateral 2          |
+| Interpolate x2         |
+| Add Lateral 1          |
++------------------------+
+| Output: (128, seq_len) |
+
++---------------------+
+| Final Output        |
+|                     |
+| Res1d(128, 128)     |
+| Output: (128, 1)    |
++---------------------+
+
+1. 为什么要使用4个 group?
+    多尺度特征提取
+        多尺度特征：每个 group 通过不同的卷积操作（尤其是第一个 Res1d 块的步长为2）生成不同尺度的特征图。这些不同尺度的特征图能够捕捉不同层次的细节信息，这对于许多任务（如目标检测、语义分割等）非常重要。
+        层次结构：通过4个 group，网络可以构建一个层次结构，从低级特征到高级特征逐步抽象。这种层次结构有助于网络学习到更丰富的特征表示。
+    特征层次
+        低级特征：第一个 group 主要捕捉低级特征，如边缘和纹理。
+        中级特征：中间的 group 捕捉中级特征，如形状和局部结构。
+        高级特征：最后一个 group 捕捉高级特征，如对象类别和全局结构。
+
+2. 每个 group 的输入是否一样？
+    输入变化：每个 group 的输入并不完全一样。第一个 group 的输入是原始输入数据，而后续的 group 的输入是前一个 group 的输出。具体来说：
+        group[0]：输入是 (batch_size, 3, seq_len)，输出是 (batch_size, 32, seq_len)。
+        group[1]：输入是 group[0] 的输出 (batch_size, 32, seq_len)，输出是 (batch_size, 64, seq_len // 2),.步幅为2, 可以控制特征图的空间尺寸变化即序列长度减半
+        group[2]：输入是 group[1] 的输出 (batch_size, 64, seq_len // 2)，输出是 (batch_size, 128, seq_len // 4)。
+        group[3]：输入是 group[2] 的输出 (batch_size, 128, seq_len // 4)，输出是 (batch_size, 256, seq_len // 8)。
+
+3.  为什么要使用4个 lateral?
+    特征融合
+        特征融合：lateral 模块通过1x1卷积将不同尺度的特征图转换为统一的通道数（hidden_size），以便上采样和加法操作将高层次的特征图与低层次的特征图进行融合。这种融合有助于结合不同尺度的特征，增强特征表示的丰富性。
+    多尺度输出
+        多尺度输出：虽然 ActorNet 最终输出的是一个固定大小的特征向量，但在融合过程中，lateral 模块确保了不同尺度的特征信息都能被充分利用。这种设计有助于网络在不同尺度上做出更准确的预测。
+
+4. 4个 lateral的输入是一样的么？不一样的话那么分别是什么？
+    lateral[0]：输入是 group[0] 的输出 (batch_size, 32, seq_len)，输出是 (batch_size, 128, seq_len)。
+    lateral[1]：输入是 group[1] 的输出 (batch_size, 64, seq_len // 2)，输出是 (batch_size, 128, seq_len // 2)。
+    lateral[2]：输入是 group[2] 的输出 (batch_size, 128, seq_len // 4)，输出是 (batch_size, 128, seq_len // 4)。
+    lateral[3]：输入是 group[3] 的输出 (batch_size, 256, seq_len // 8)，输出是 (batch_size, 128, seq_len // 8)。
+
+5. Interpolate and Add 的作用
+    插值（Interpolate）
+        上采样：插值操作用于将高层次的特征图（低分辨率）上采样到低层次的特征图（高分辨率）的尺寸。这通常通过线性插值（F.interpolate）实现。
+        对齐：插值操作确保不同尺度的特征图在空间维度上对齐，以便进行逐元素的加法操作。
+    加法（Add）
+        特征融合：加法操作将上采样后的高层次特征图与低层次特征图逐元素相加，实现特征融合。这种融合有助于结合不同尺度的特征信息，增强模型的表示能力。
+
+6. Interpolate and Add 的输入输出
+    初始特征
+        group[3] 的输出：(batch_size, 256, seq_len // 8)
+        lateral[3] 的输出：(batch_size, 128, seq_len // 8)
+    第一层 Interpolate and Add
+        输入：lateral[3] 的输出 (batch_size, 128, seq_len // 8)
+        插值操作：将 (batch_size, 128, seq_len // 8) 上采样到 (batch_size, 128, seq_len // 4)
+        lateral[2] 的输出：(batch_size, 128, seq_len // 4)
+        加法操作：(batch_size, 128, seq_len // 4) + (batch_size, 128, seq_len // 4) = (batch_size, 128, seq_len // 4)
+    第二层 Interpolate and Add
+        输入：第一层 Interpolate and Add 的输出 (batch_size, 128, seq_len // 4)
+        插值操作：将 (batch_size, 128, seq_len // 4) 上采样到 (batch_size, 128, seq_len // 2)
+        lateral[1] 的输出：(batch_size, 128, seq_len // 2)
+        加法操作：(batch_size, 128, seq_len // 2) + (batch_size, 128, seq_len // 2) = (batch_size, 128, seq_len // 2)
+    第三层 Interpolate and Add
+        输入：第二层 Interpolate and Add 的输出 (batch_size, 128, seq_len // 2)
+        插值操作：将 (batch_size, 128, seq_len // 2) 上采样到 (batch_size, 128, seq_len)
+        lateral[0] 的输出：(batch_size, 128, seq_len)
+        加法操作：(batch_size, 128, seq_len) + (batch_size, 128, seq_len) = (batch_size, 128, seq_len)
+'''
 # ActorNet 是一个多尺度的卷积神经网络（借鉴了FPN），通过特征金字塔结构提取不同层次的特征，结合了残差连接和上采样机制，适用于处理时序数据或一维信号特征提取
 # 用来建模这些交通参与者的动态行为, 识别其他交通参与者的动作和意图，预测它们在未来几秒内的可能移动路径
 class ActorNet(nn.Module):
@@ -21,7 +114,7 @@ class ActorNet(nn.Module):
         norm = "GN" # 归一化方法，这里是“GN”（Group Normalization）
         ng = 1
 
-        n_out = [2 ** (5 + s) for s in range(n_fpn_scale)]  # [32, 64, 128]
+        n_out = [2 ** (5 + s) for s in range(n_fpn_scale)]  # [32, 64, 128, 256]
         blocks = [Res1d] * n_fpn_scale
         num_blocks = [2] * n_fpn_scale
 
@@ -31,13 +124,13 @@ class ActorNet(nn.Module):
             if i == 0:
                 group.append(blocks[i](n_in, n_out[i], norm=norm, ng=ng))
             else:
-                group.append(blocks[i](n_in, n_out[i], stride=2, norm=norm, ng=ng))
+                group.append(blocks[i](n_in, n_out[i], stride=2, norm=norm, ng=ng))  # seq_len_out = (seq_len_in + 2 * padding - kernel_size) / stride + 1
 
             for j in range(1, num_blocks[i]):
                 group.append(blocks[i](n_out[i], n_out[i], norm=norm, ng=ng))
-            groups.append(nn.Sequential(*group))
+            groups.append(nn.Sequential(*group))    # 
             n_in = n_out[i]
-        self.groups = nn.ModuleList(groups)
+        self.groups = nn.ModuleList(groups) # 
 
         lateral = []
         for i in range(len(n_out)):
@@ -46,99 +139,6 @@ class ActorNet(nn.Module):
 
         self.output = Res1d(hidden_size, hidden_size, norm=norm, ng=ng)
 
-    '''
-    ActorNet
-
-    Input: (batch_size, 3, seq_len)
-
-    +------------------------+      +---------------------------+      +---------------------------+       +---------------------------+
-    | Group 1                |      | Group 2                   |      | Group 3                   |       | Group 4                   |
-    |                        |      |                           |      |                           |       |                           |
-    | Res1d(3, 32)           |      | Res1d(32, 64, 2)          |      | Res1d(64, 128, 2)         |       | Res1d(128, 256, 2)        |
-    | Res1d(32, 32)          |      | Res1d(64, 64)             |      | Res1d(128, 128)           |       | Res1d(256, 256)           |
-    +------------------------+      +---------------------------+      +---------------------------+       +---------------------------+
-    | Output: (32, seq_len)  |      | Output: (64, seq_len//2)  |      | Output: (128, seq_len//4) |       | Output: (256, seq_len//8) |
-
-    +------------------------+      +---------------------------+      +---------------------------+       +---------------------------+
-    | Lateral 1              |      | Lateral 2                 |      | Lateral 3                 |       | Lateral 4                 |
-    | Conv1d(32, 128)        |      | Conv1d(64, 128)           |      | Conv1d(128, 128)          |       | Conv1d(256, 128)          |
-    +------------------------+      +---------------------------+      +---------------------------+       +---------------------------+
-    | Output: (128, seq_len) |      | Output: (128, seq_len//2) |      | Output: (128, seq_len//4) |       | Output: (128, seq_len//8) |
-
-    +------------------------+
-    | Interpolate and Add    |
-    |                        |
-    | Interpolate x2         |
-    | Add Lateral 3          |
-    | Interpolate x2         |
-    | Add Lateral 2          |
-    | Interpolate x2         |
-    | Add Lateral 1          |
-    +------------------------+
-    | Output: (128, seq_len) |
-
-    +---------------------+
-    | Final Output        |
-    |                     |
-    | Res1d(128, 128)     |
-    | Output: (128, 1)    |
-    +---------------------+
-
-    1. 为什么要使用4个 group?
-        多尺度特征提取
-            多尺度特征：每个 group 通过不同的卷积操作（尤其是第一个 Res1d 块的步长为2）生成不同尺度的特征图。这些不同尺度的特征图能够捕捉不同层次的细节信息，这对于许多任务（如目标检测、语义分割等）非常重要。
-            层次结构：通过4个 group，网络可以构建一个层次结构，从低级特征到高级特征逐步抽象。这种层次结构有助于网络学习到更丰富的特征表示。
-        特征层次
-            低级特征：第一个 group 主要捕捉低级特征，如边缘和纹理。
-            中级特征：中间的 group 捕捉中级特征，如形状和局部结构。
-            高级特征：最后一个 group 捕捉高级特征，如对象类别和全局结构。
-
-    2. 每个 group 的输入是否一样？
-        输入变化：每个 group 的输入并不完全一样。第一个 group 的输入是原始输入数据，而后续的 group 的输入是前一个 group 的输出。具体来说：
-            group[0]：输入是 (batch_size, 3, seq_len)，输出是 (batch_size, 32, seq_len)。
-            group[1]：输入是 group[0] 的输出 (batch_size, 32, seq_len)，输出是 (batch_size, 64, seq_len // 2)。
-            group[2]：输入是 group[1] 的输出 (batch_size, 64, seq_len // 2)，输出是 (batch_size, 128, seq_len // 4)。
-            group[3]：输入是 group[2] 的输出 (batch_size, 128, seq_len // 4)，输出是 (batch_size, 256, seq_len // 8)。
-
-    3.  为什么要使用4个 lateral?
-        特征融合
-            特征融合：lateral 模块通过1x1卷积将不同尺度的特征图转换为统一的通道数（hidden_size），以便上采样和加法操作将高层次的特征图与低层次的特征图进行融合。这种融合有助于结合不同尺度的特征，增强特征表示的丰富性。
-        多尺度输出
-            多尺度输出：虽然 ActorNet 最终输出的是一个固定大小的特征向量，但在融合过程中，lateral 模块确保了不同尺度的特征信息都能被充分利用。这种设计有助于网络在不同尺度上做出更准确的预测。
-
-    4. 4个 lateral的输入是一样的么？不一样的话那么分别是什么？
-        lateral[0]：输入是 group[0] 的输出 (batch_size, 32, seq_len)，输出是 (batch_size, 128, seq_len)。
-        lateral[1]：输入是 group[1] 的输出 (batch_size, 64, seq_len // 2)，输出是 (batch_size, 128, seq_len // 2)。
-        lateral[2]：输入是 group[2] 的输出 (batch_size, 128, seq_len // 4)，输出是 (batch_size, 128, seq_len // 4)。
-        lateral[3]：输入是 group[3] 的输出 (batch_size, 256, seq_len // 8)，输出是 (batch_size, 128, seq_len // 8)。
-
-    5. Interpolate and Add 的作用
-        插值（Interpolate）
-            上采样：插值操作用于将高层次的特征图（低分辨率）上采样到低层次的特征图（高分辨率）的尺寸。这通常通过线性插值（F.interpolate）实现。
-            对齐：插值操作确保不同尺度的特征图在空间维度上对齐，以便进行逐元素的加法操作。
-        加法（Add）
-            特征融合：加法操作将上采样后的高层次特征图与低层次特征图逐元素相加，实现特征融合。这种融合有助于结合不同尺度的特征信息，增强模型的表示能力。
-
-    6. Interpolate and Add 的输入输出
-        初始特征
-            group[3] 的输出：(batch_size, 256, seq_len // 8)
-            lateral[3] 的输出：(batch_size, 128, seq_len // 8)
-        第一层 Interpolate and Add
-            输入：lateral[3] 的输出 (batch_size, 128, seq_len // 8)
-            插值操作：将 (batch_size, 128, seq_len // 8) 上采样到 (batch_size, 128, seq_len // 4)
-            lateral[2] 的输出：(batch_size, 128, seq_len // 4)
-            加法操作：(batch_size, 128, seq_len // 4) + (batch_size, 128, seq_len // 4) = (batch_size, 128, seq_len // 4)
-        第二层 Interpolate and Add
-            输入：第一层 Interpolate and Add 的输出 (batch_size, 128, seq_len // 4)
-            插值操作：将 (batch_size, 128, seq_len // 4) 上采样到 (batch_size, 128, seq_len // 2)
-            lateral[1] 的输出：(batch_size, 128, seq_len // 2)
-            加法操作：(batch_size, 128, seq_len // 2) + (batch_size, 128, seq_len // 2) = (batch_size, 128, seq_len // 2)
-        第三层 Interpolate and Add
-            输入：第二层 Interpolate and Add 的输出 (batch_size, 128, seq_len // 2)
-            插值操作：将 (batch_size, 128, seq_len // 2) 上采样到 (batch_size, 128, seq_len)
-            lateral[0] 的输出：(batch_size, 128, seq_len)
-            加法操作：(batch_size, 128, seq_len) + (batch_size, 128, seq_len) = (batch_size, 128, seq_len)
-    '''
     def forward(self, actors: Tensor) -> Tensor:
         out = actors
 
