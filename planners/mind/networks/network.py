@@ -196,7 +196,11 @@ class PointAggregateBlock(nn.Module):
 
     # 通过全局最大池化（Global Max Pooling）将每个车道的所有特征点聚合为一个全局特征向量：得到每个车道的一个全局特征向量
     def _global_maxpool_aggre(self, feat):
-        return F.adaptive_max_pool1d(feat.permute(0, 2, 1), 1).permute(0, 2, 1)
+        # 输入：方法接受一个张量feat，通常是一个三维张量，形状为 [N_{lane}, 10, hidden_size]，其中 N_{lane} 是车道的数量，10 是每个车道的特征点数量，hidden_size 是每个特征点的特征维度
+        # 维度调整：feat.permute(0, 2, 1)：将特征张量的维度顺序从 [N_{lane}, 10, hidden_size] 调整为 [N_{lane}, hidden_size, 10]。这样做是为了使得adaptive_max_pool1d函数的输入格式符合要求
+        # 全局最大池化：F.adaptive_max_pool1d(..., 1) 对重新排列后的张量进行全局最大池化操作，将每个特征的时间维度压缩为1，输出形状为 (batch_size, 1, features)。这意味着它为每个特征通道计算了一个最大值
+        # 维度恢复：最后，permute(0, 2, 1) 将池化后的特征张量的维度恢复为 [N_{lane}, 1, hidden_size]，使得输出与原始特征的维度格式一致
+        return F.adaptive_max_pool1d(feat.permute(0, 2, 1), 1).permute(0, 2, 1) # 重点是F.adaptive_max_pool1d(..., 1) 
 
     def forward(self, x_inp):
         # 1. fc1层目的是对输入特征进行非线性变换，提取出更高级的特征表示
@@ -266,7 +270,7 @@ class LaneNet(nn.Module):
     # for av2
     def forward(self, feats):
         x = self.proj(feats)  # [N_{lane}, 10, hidden_size]
-        x = self.aggre1(x)
+        x = self.aggre1(x)  # 在 PointAggregateBlock 中，聚合层指的是将每个车道的所有特征点聚合为一个全局特征向量，并将这个全局特征向量与局部特征点进行融合
         x = self.aggre2(x)  # [N_{lane}, hidden_size]
         return x
 
