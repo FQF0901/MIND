@@ -118,7 +118,7 @@ class ActorNet(nn.Module):
         blocks = [Res1d] * n_fpn_scale
         num_blocks = [2] * n_fpn_scale
 
-        groups = [] # 每个 group 包含多个 Res1d 块，每个 Res1d 块的输出通道数为 n_out[i]，步长为1或2（取决于是否是第一个块）
+        groups = [] # groups 变量是一个列表，其中每个元素都是一个 nn.Sequential 容器。每个 nn.Sequential 容器包含一组 Res1d 块，这些块在同一个 FPN（Feature Pyramid Network）尺度上工作
         for i in range(len(num_blocks)):
             group = []
             if i == 0:
@@ -128,9 +128,9 @@ class ActorNet(nn.Module):
 
             for j in range(1, num_blocks[i]):
                 group.append(blocks[i](n_out[i], n_out[i], norm=norm, ng=ng))
-            groups.append(nn.Sequential(*group))    # 
+            groups.append(nn.Sequential(*group))    # nn.Sequential 是一个容器，它按照添加的顺序执行内部包含的所有模块，适合于线性堆叠的层结构
             n_in = n_out[i]
-        self.groups = nn.ModuleList(groups) # 
+        self.groups = nn.ModuleList(groups) # nn.ModuleList 是一个特殊的列表，用于存储 nn.Module 子类的实例
 
         lateral = []
         for i in range(len(n_out)):
@@ -147,12 +147,24 @@ class ActorNet(nn.Module):
             out = self.groups[i](out)
             outputs.append(out)
 
+        # self.lateral[-1]：这是一个 nn.Conv1d 层，位于 self.lateral 列表的最后一个位置
+        # outputs[-1]：这是 outputs 列表的最后一个元素，即最高层的特征图
+        # 将最高层的特征图 outputs[-1] 通过 self.lateral[-1] 层进行特征变换，得到新的特征图 out
         out = self.lateral[-1](outputs[-1])
-        for i in range(len(outputs) - 2, -1, -1):
-            out = F.interpolate(out, scale_factor=2, mode="linear", align_corners=False)
-            out += self.lateral[i](outputs[i])
 
-        out = self.output(out)[:, :, -1]
+        for i in range(len(outputs) - 2, -1, -1):   # range(len(outputs) - 2, -1, -1)：这是一个 range 函数，生成一个从 len(outputs) - 2 到 0 的递减序列
+            # F.interpolate：这是 PyTorch 中的一个函数，用于对张量进行上采样（upsampling）。它会将输入张量的分辨率放大指定的倍数
+            # scale_factor=2：上采样的比例因子，即将特征图的分辨率放大 2 倍
+            # mode="linear"：上采样的模式，这里使用线性插值
+            # align_corners=False：是否对齐角点，这里设置为 False，意味着插值时不考虑角点对齐
+            out = F.interpolate(out, scale_factor=2, mode="linear", align_corners=False)    # 上采样操作通过 F.interpolate 将特征图的分辨率恢复到上一层的分辨率
+            # self.lateral[i]：这是 self.lateral 列表中的第 i 个 nn.Conv1d 层
+            # outputs[i]：这是 outputs 列表中的第 i 个特征图
+            # 操作：将 outputs[i] 通过 self.lateral[i] 层进行特征变换，然后将结果加到当前的特征图 out 上，实现特征融合
+            out += self.lateral[i](outputs[i])  # 横向连接通过 self.lateral[i] 将自底向上路径中的特征图与自顶向下路径中的特征图进行融合
+
+        # [:, :, -1]：选择最后一个时间步的特征。假设 out 的形状为 (batch_size, channels, seq_len)，[:, :, -1] 会选择 out 的最后一个时间步，即 out[:, :, -1] 的形状为 (batch_size, channels)
+        out = self.output(out)[:, :, -1]    # 通过 self.output 层对融合后的特征图进行最终的特征提取, 选择最后一个时间步的特征作为输出
         return out
 
 # 在自动驾驶任务中，特别是涉及车道检测和轨迹预测时，每个车道上的特征点（如车道线上的点）包含了丰富的信息。
