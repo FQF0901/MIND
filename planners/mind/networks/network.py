@@ -4,6 +4,7 @@ import numpy as np
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.nn import MultiheadAttention, TransformerEncoderLayer, TransformerEncoder
+from torchviz import make_dot
 from typing import Dict, List, Tuple, Optional
 from planners.mind.utils import gpu
 from planners.mind.networks.layers import Conv1d, Res1d
@@ -1122,3 +1123,11 @@ class ScenePredNet(nn.Module):
         tgt_rpe = gpu(data['TGT_RPE'], self.device)
 
         return actors, actor_idcs, lanes, lane_idcs, rpe, tgt_nodes, tgt_rpe
+    
+
+# ----------------- Network architecture visualization -----------------
+# x = torch.randn(4, 3, 32, 32)   # need to debug
+# model = ScenePredNet()
+# out = model(x)
+# g = make_dot(out)
+# g.view()
