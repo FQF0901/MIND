@@ -208,14 +208,20 @@ class PointAggregateBlock(nn.Module):
 
         # 2. 将原始特征和全局特征向量拼接在一起，形成新的特征表示。这样可以保留局部特征的同时，加入全局特征的信息
         x_aggre = self._global_maxpool_aggre(x)
+        # x形状为 [N_{lane}, 10, hidden_size], x_aggre形状为 [N_{lane}, 1, hidden_size]
+        # x_aggre.repeat([1, x.shape[1], 1])将全局池化结果沿时间维度（第二维）重复10次，以使其形状为[N_lane, 10, hidden_size]，与局部特征x一致。
+        # torch.cat(..., dim=-1)将局部特征x和全局特征x_aggre拼接在一起，形成一个新的张量，包含了局部和全局特征的信息。
         x_aggre = torch.cat([x, x_aggre.repeat([1, x.shape[1], 1])], dim=-1)
 
         # 3. fc2层的目的是将局部特征和全局特征有效融合，生成更鲁棒的特征表示
+        # self.fc2(x_aggre)：通过 fc2 层进行两次线性变换和层归一化，中间使用 ReLU 激活函数，将特征维度从 hidden_size * 2 降回到 hidden_size。
+        # x_inp + self.fc2(x_aggre)：将原始输入特征 x_inp 与 fc2 层的输出相加，实现残差连接。
+        # self.norm(...)：通过层归一化对相加后的特征进行归一化，稳定训练过程。
         out = self.norm(x_inp + self.fc2(x_aggre))
         if self.aggre_out:
-            return self._global_maxpool_aggre(out).squeeze()
+            return self._global_maxpool_aggre(out).squeeze()    # 通过 _global_maxpool_aggre 方法将 out 聚合为全局特征向量，并使用 squeeze 去除多余的维度，形状为 [N_{lane}, hidden_size]
         else:
-            return out
+            return out  # 形状为 [N_{lane}, 10, hidden_size]
 
 '''
 LaneNet
