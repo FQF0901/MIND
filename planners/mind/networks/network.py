@@ -681,7 +681,7 @@ class SceneDecoder(nn.Module):
 
         参数:
         - device: 用于指定运行设备（如CPU或GPU）。
-        - param_out: 指定输出参数的类型，默认为'none'。
+        - param_out: 指定输出参数的类型，默认为'none'。也可以是 'bezier'或'monomial'
         - hidden_size: 隐藏层的大小，默认为128。
         - future_steps: 预测的未来步数，默认为30。
         - num_modes: 模式数量，默认为6。
@@ -696,7 +696,7 @@ class SceneDecoder(nn.Module):
         self.device = device
         self.param_out = param_out
 
-        # 计算演员（actor）和上下文（ctx）投影层的维度，并初始化投影层
+        # 1. Actor 投影
         dim_mm = self.hidden_size * num_modes
         dim_inter = dim_mm // 2
         self.actor_proj = nn.Sequential(
@@ -708,7 +708,7 @@ class SceneDecoder(nn.Module):
             nn.ReLU(inplace=True)   # ReLU激活函数
         )
 
-        # context projection，表示上下文投影层
+        # 2. Context 投影: 通常包括道路布局、其他车辆的位置和速度等
         self.ctx_proj = nn.Sequential(
             nn.Linear(self.hidden_size, dim_inter), # 第一层线性变换
             nn.LayerNorm(dim_inter),    # 层归一化
@@ -718,18 +718,18 @@ class SceneDecoder(nn.Module):
             nn.ReLU(inplace=True)   # ReLU激活函数
         )
 
-        # several layers of transformer encoder
+        # 3. Transformer 编码器：several layers of transformer encoder
         enc_layer = TransformerEncoderLayer(d_model=self.hidden_size, nhead=4, dim_feedforward=self.hidden_size * 12)
-        self.ctx_sat = TransformerEncoder(enc_layer, num_layers=2)  # context saturation上下文饱和层，增强上下文信息的表示能力
+        self.ctx_sat = TransformerEncoder(enc_layer, num_layers=2)  # context saturation上下文饱和层，通过多层 Transformer 编码器对上下文特征进行深度处理以增强上下文信息的表示能力
 
-        # linear projection for rpe embedding rpe_dim = 11
+        # 4. RPE 嵌入投影：linear projection for rpe embedding rpe_dim = 11
         self.proj_rpe = nn.Sequential(
             nn.Linear(5 * 2 * 2, self.hidden_size), # 输入维度为20，输出维度为hidden_size
             nn.LayerNorm(self.hidden_size), # 层归一化
             nn.ReLU(inplace=True)   # ReLU激活函数
         )
 
-        # 初始化目标投影层
+        # 5. Target 特征投影
         self.proj_tgt = nn.Sequential(
             nn.Linear(2 * self.hidden_size, self.hidden_size),
             nn.LayerNorm(self.hidden_size),
@@ -739,7 +739,7 @@ class SceneDecoder(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # 初始化分类器
+        # 6. 分类头
         self.cls = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.LayerNorm(self.hidden_size),
@@ -750,11 +750,11 @@ class SceneDecoder(nn.Module):
             nn.Linear(self.hidden_size, 1)
         )
 
-        # 根据param_out参数初始化回归器
+        # 7. 回归头
         if self.param_out == 'bezier':
             self.N_ORDER = 7
-            self.mat_T = self._get_T_matrix_bezier(n_order=self.N_ORDER, n_step=future_steps).to(self.device)
-            self.mat_Tp = self._get_Tp_matrix_bezier(n_order=self.N_ORDER, n_step=future_steps).to(self.device)
+            self.mat_T = self._get_T_matrix_bezier(n_order=self.N_ORDER, n_step=future_steps).to(self.device)   # 生成贝塞尔曲线的参数矩阵 T
+            self.mat_Tp = self._get_Tp_matrix_bezier(n_order=self.N_ORDER, n_step=future_steps).to(self.device) # 生成贝塞尔曲线的一阶导数参数矩阵 Tp
             self.reg = nn.Sequential(
                 nn.Linear(self.hidden_size, self.hidden_size),
                 nn.LayerNorm(self.hidden_size),
@@ -766,8 +766,8 @@ class SceneDecoder(nn.Module):
             )
         elif self.param_out == 'monomial':
             self.N_ORDER = 7
-            self.mat_T = self._get_T_matrix_monomial(n_order=self.N_ORDER, n_step=future_steps).to(self.device)
-            self.mat_Tp = self._get_Tp_matrix_monomial(n_order=self.N_ORDER, n_step=future_steps).to(self.device)
+            self.mat_T = self._get_T_matrix_monomial(n_order=self.N_ORDER, n_step=future_steps).to(self.device) # 生成多项式的参数矩阵 T
+            self.mat_Tp = self._get_Tp_matrix_monomial(n_order=self.N_ORDER, n_step=future_steps).to(self.device)   # 生成多项式的一阶导数参数矩阵 Tp
             self.reg = nn.Sequential(
                 nn.Linear(self.hidden_size, self.hidden_size),
                 nn.LayerNorm(self.hidden_size),
@@ -846,37 +846,39 @@ class SceneDecoder(nn.Module):
         - res_aux: 辅助结果列表
         """
         res_cls, res_reg, res_aux = [], [], []
-        # 对目标相对于位置的嵌入进行投影:high-level commands的target node
+        # 1. RPE 嵌入投影: high-level commands的target node
         tgt_rpes = self.proj_rpe(tgt_rpes)  # [n_av, 128]
-        # 如果目标特征维度为1，增加一个维度
+        # 2. 目标特征投影
         if len(tgt_feat.shape) == 1:
-            tgt_feat = tgt_feat.unsqueeze(0)
+            tgt_feat = tgt_feat.unsqueeze(0)    # 如果目标特征维度为1，增加一个维度
 
         # 对目标特征和相对位置嵌入的组合进行投影
         tgt = self.proj_tgt(torch.cat([tgt_feat, tgt_rpes], dim=-1))
 
-        # 遍历每个agent索引，进行特征嵌入和预测
+        # 3. 遍历每个agent索引，进行特征嵌入和预测
         for idx, a_idcs in enumerate(actor_idcs):
             _ctx = ctx[idx].unsqueeze(0)    # 获取当前交通上下文并调整维度
             _actors = actors[a_idcs]    # 获取当前agent特征
 
-            # 对交通上下文进行投影并调整维度，然后进行饱和处理
+            # 4. 上下文投影：对交通上下文进行投影并调整维度，然后进行饱和处理
             cls_embed = self.ctx_proj(_ctx).view(-1, self.num_modes, self.hidden_size).permute(1, 0, 2)
             cls_embed = self.ctx_sat(cls_embed)
 
-            # 对agent特征进行投影并调整维度
+            # 5. Agent 投影：对agent特征进行投影并调整维度
             actor_embed = self.actor_proj(_actors).view(-1, self.num_modes, self.hidden_size).permute(1, 0, 2)
 
-            # 初始化目标嵌入，并将第一个目标嵌入设置为投影后的目标特征
+            # 6. 目标嵌入：初始化目标嵌入，并将第一个目标嵌入设置为投影后的目标特征
             # 猜测：high-level commands的target node
             tgt_embed = torch.zeros_like(actor_embed)
             tgt_embed[0] = tgt[idx].unsqueeze(0)
 
-            # 结合交通上下文、agent和目标嵌入，进行分类和回归预测
-            embed = cls_embed + actor_embed + tgt_embed
+            # 7. 特征融合：进行分类和回归预测
+            embed = cls_embed + actor_embed + tgt_embed # 结合交通上下文、agent和目标嵌入
+
+            # 8. 分类：分类头的主要作用是确定每个预测模式的概率分布。具体来说，分类头会输出一个概率值，表示每个预测模式的可能性
             cls = self.cls(cls_embed).view(self.num_modes, -1)
 
-            # 根据不同的输出参数，计算回归参数、速度和协方差
+            # 9. 回归：回归头的主要作用是生成具体的未来轨迹。具体来说，回归头会输出每个预测模式下的具体轨迹点坐标及其相关属性（如速度、协方差等）
             if self.param_out == 'bezier':
                 # 通过 self.reg 层处理 embed 向量，然后将其重塑为形状 (num_modes, -1, N_ORDER + 1, 5) 的张量
                 # param 包含了不同模式下的贝塞尔曲线参数，每个模式有 N_ORDER + 1 个控制点，每个控制点有 5 个参数
