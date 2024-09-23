@@ -490,15 +490,18 @@ class RelaFusionLayer(nn.Module):
                    key_padding_mask: Optional[Tensor]) -> Tensor:
         '''
             input:
-                x:                  [1, N, d_model]
-                mem:                [N, N, d_model]
-                attn_mask:          [N, N]
-                key_padding_mask:   [N, N]
+                x:                  [1, N, d_model], 表示输入的节点特征
+                mem:                [N, N, d_model], 表示记忆表示
+                attn_mask:          [N, N]，表示注意力掩码，用于防止某些位置之间的注意力计算
+                key_padding_mask:   [N, N]，表示键填充掩码，用于处理序列中的填充部分
             output:
                 :param      [1, N, d_model]
                 :param      [N, N]
         '''
-        x, _ = self.multihead_attn(x, mem, mem,
+
+        # x：更新后的节点特征，形状为 [1, N, d_model]。
+        # _：注意力权重，由于 need_weights=False，这里返回 None。
+        x, _ = self.multihead_attn(x, mem, mem, # x 是查询（Query）,mem 同时作为键（Key）和值（Value）
                                    attn_mask=attn_mask,
                                    key_padding_mask=key_padding_mask,
                                    need_weights=False)  # return average attention weights
@@ -517,7 +520,7 @@ class RelaFusionNet(nn.Module):
                  d_model: int = 128,
                  d_edge: int = 128,
                  n_head: int = 8,
-                 n_layer: int = 6,
+                 n_layer: int = 6,  # 创建 n_layer 个 RelaFusionLayer 层
                  dropout: float = 0.1,
                  update_edge: bool = True):
         super(RelaFusionNet, self).__init__()
@@ -537,9 +540,10 @@ class RelaFusionNet(nn.Module):
 
     def forward(self, x: Tensor, edge: Tensor, edge_mask: Tensor) -> Tensor:
         '''
-            x: (N, d_model)
-            edge: (d_model, N, N)
-            edge_mask: (N, N)
+            该forward会在out, _ = self.fuse_scene(tokens_with_cls, rpe_with_cls, edge_mask=None)被调用
+            x: (N, d_model)，表示每个节点的特征向量: tokens_with_cls
+            edge: (d_model, N, N)，表示每条边的特征矩阵。d_model 是特征维度，N 是节点数: rpe_with_cls
+            edge_mask: (N, N)，用于指示哪些边是有效的。通常是一个布尔矩阵，有效边的位置为 True，无效边的位置为 False: edge_mask=None
         '''
         # attn_multilayer = []
         for mod in self.fusion:
@@ -609,6 +613,7 @@ class FusionNet(nn.Module):
                 rpe_prep: Dict[str, Tensor]):
         """
         前向传播函数，用于处理输入的演员和车道数据，并融合场景信息。
+        这里需要注意的是cls: 这种在序列模型中使用分类 token 的做法，主要是借鉴了 BERT，旨在通过引入全局表示来提高模型的效果，特别是在需要进行分类或序列理解的任务上
 
         :param actors: 输入的演员数据张量
         :param actor_idcs: 演员数据的索引列表
@@ -622,9 +627,10 @@ class FusionNet(nn.Module):
         lanes = self.proj_lane(lanes)
 
         # 初始化新的数据列表
-        actors_new, lanes_new, cls_new = list(), list(), list()
+        actors_new, lanes_new, cls_new = list(), list(), list() # 其中cls_new用于存储分类 token 的特征
 
-        # 遍历每个样本的演员和车道数据，进行融合处理
+        # 遍历每个场景中的演员和车道数据，以便在后续的处理中对每个场景进行单独的特征提取和融合
+        # 这里有疑问：输入的actor、lane和rpe是以场景为单位打包的？
         for a_idcs, l_idcs, rpes in zip(actor_idcs, lane_idcs, rpe_prep):
             # 获取当前样本的演员和车道数据
             _actors = actors[a_idcs]
@@ -633,9 +639,8 @@ class FusionNet(nn.Module):
             tokens = torch.cat([_actors, _lanes], dim=0)
 
             # 创建CLS标记(Classification Token)，并将其添加到合并的数据中, 此处借鉴BERT的架构
-            # CLS标记是一个额外的输入标记，用于帮助模型学习整个输入序列的全局特征，通常用于分类任务
-            cls_token = torch.zeros((1, self.d_model), device=self.device)
-            tokens_with_cls = torch.cat([tokens, cls_token], dim=0)
+            cls_token = torch.zeros((1, self.d_model), device=self.device)  # 创建一个形状为 (1, d_model) 的零张量，作为分类 token
+            tokens_with_cls = torch.cat([tokens, cls_token], dim=0) # 将分类 token 拼接到 tokens 的末尾
 
             # 对相对位置嵌入进行投影，并调整形状
             rpe = self.proj_rpe_scene(rpes['scene'].permute(1, 2, 0))
@@ -649,7 +654,7 @@ class FusionNet(nn.Module):
             rpe_with_cls[:tokens.shape[0], :tokens.shape[0], :] = rpe
 
             # 使用融合模块处理数据和相对位置嵌入
-            out, _ = self.fuse_scene(tokens_with_cls, rpe_with_cls, edge_mask=None)
+            out, _ = self.fuse_scene(tokens_with_cls, rpe_with_cls, edge_mask=None) # 实际对应RelaFusionLayer中forward的node、edge、edge_mask
 
             # 将处理结果分别添加到对应的列表中
             actors_new.append(out[:len(a_idcs)])
